@@ -1,0 +1,35 @@
+CAR CONTROLLER - STUDIO SETUP
+=============================
+
+Files (paste each one's full contents into the matching script):
+  ReplicatedStorage/RLShared.txt                        -> ModuleScript "RLShared"   in ReplicatedStorage
+  ReplicatedStorage/CarConfig.txt                       -> ModuleScript "CarConfig"  in ReplicatedStorage
+  ServerScriptService/CarController.txt                 -> Script       "CarController" in ServerScriptService
+  StarterPlayer/StarterPlayerScripts/CarInput.txt       -> LocalScript  "CarInput"   in StarterPlayer > StarterPlayerScripts
+
+Checklist (duplicate, don't Insert: freshly inserted scripts come out sandboxed):
+  1. Select any ModuleScript that already works in your place, press Ctrl+D twice.
+     Rename the copies to RLShared and CarConfig, drag both into ReplicatedStorage,
+     delete their old code and paste in RLShared.txt / CarConfig.txt.
+  2. Select any Script that already works, Ctrl+D, rename to CarController, drag into
+     ServerScriptService, replace its code with CarController.txt.
+  3. Select any LocalScript that already works, Ctrl+D, rename to CarInput, drag into
+     StarterPlayer > StarterPlayerScripts, replace its code with CarInput.txt.
+  4. (Optional) Workspace: make a Folder named CarSpawns with anchored Parts in it.
+     Each part's front face is the direction the car faces when it spawns.
+     Without it, cars spawn at the world origin.
+  5. (Optional) ServerStorage: make a Folder named CarTemplates, put your car Model in it
+     named Octane. Give it a Part named Hitbox (size is set automatically) and your car
+     mesh; the mesh is welded to the hitbox and made non-colliding for you.
+     Without it, a blocky placeholder Octane is built.
+  6. Delete or disable any old vehicle / VehicleSeat / character-movement scripts so
+     they don't fight this one. Characters are turned off (CarConfig.DISABLE_CHARACTERS).
+  7. Press Play. A Baseplate is enough to drive; walls need curved ramps (like RL's
+     arena corners) to drive up them.
+
+Controls: W/S throttle, A/D steer, Space or Right Mouse jump, Left Mouse or Ctrl boost,
+Left Shift powerslide / air roll, Q/E air roll left/right, Y ball cam.
+Gamepad: RT/LT, left stick, A jump, B boost, X powerslide, LB/RB air roll, Y ball cam.
+
+Debugging: set DEBUG = true at the top of CarController / CarInput (tags [CAR], [CARINPUT]),
+or CarConfig.SHOW_HITBOX = true to see the hitbox.

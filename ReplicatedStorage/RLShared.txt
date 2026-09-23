@@ -50,7 +50,7 @@ RLShared.REMOTES = {
 
 -- Car Model attributes other systems may read (written only by CarController)
 --   OwnerUserId  number   player who drives it
---   Boost        number   0..100
+--   Boost        number   0..100 (source of truth; boost pads may add to it on the server)
 --   Boosting     boolean
 --   Grounded     boolean
 --   Supersonic   boolean  speed >= 2200 uu/s
