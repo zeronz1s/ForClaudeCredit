@@ -18,10 +18,15 @@ Checklist (duplicate, don't Insert: freshly inserted scripts come out sandboxed)
   4. (Optional) Workspace: make a Folder named CarSpawns with anchored Parts in it.
      Each part's front face is the direction the car faces when it spawns.
      Without it, cars spawn at the world origin.
-  5. (Optional) ServerStorage: make a Folder named CarTemplates, put your car Model in it
-     named Octane. Give it a Part named Hitbox (size is set automatically) and your car
-     mesh; the mesh is welded to the hitbox and made non-colliding for you.
-     Without it, a blocky placeholder Octane is built.
+  5. Car body (your Car Kit meshes): use the files in models/roblox-ready (the texture is
+     baked in, so they import in color). In Studio: File > Import 3D, pick race.glb, import it.
+     Make a Folder in ServerStorage named CarTemplates and drag the imported Model into it.
+     Keep the Model's name "race" (it must match CarConfig.CAR_TEMPLATE_NAME).
+     Don't add a Hitbox part: the controller builds one, scales the mesh to it and finds the
+     car's nose from its wheel parts. To drive a different body, import it the same way and
+     set CarConfig.CAR_TEMPLATE_NAME to its name (e.g. "sedan-sports"); CarConfig.TEMPLATE_HITBOXES
+     picks the matching RL hitbox. If the car faces backwards, change CarConfig.MESH_YAW_OFFSET.
+     Without a template, a blocky placeholder car is built.
   6. Delete or disable any old vehicle / VehicleSeat / character-movement scripts so
      they don't fight this one. Characters are turned off (CarConfig.DISABLE_CHARACTERS).
   7. Press Play. A Baseplate is enough to drive; walls need curved ramps (like RL's

@@ -18,8 +18,36 @@ CarConfig.DEBUG = false
 
 CarConfig.DISABLE_CHARACTERS = true   -- players are cars; no R6 body spawns
 CarConfig.SHOW_HITBOX = false         -- true = draw the hitbox as a translucent box
-CarConfig.CAR_TEMPLATE_NAME = "Octane" -- ServerStorage > CarTemplates > <this>, built-in placeholder if missing
-CarConfig.HITBOX_PRESET = "Octane"    -- key into HITBOXES below
+CarConfig.CAR_TEMPLATE_NAME = "race"  -- ServerStorage > CarTemplates > <this>, built-in placeholder if missing
+CarConfig.HITBOX_PRESET = "Octane"    -- key into HITBOXES below (TEMPLATE_HITBOXES overrides it per car)
+
+-- Mesh car bodies (Car Kit .glb imports). The controller builds the hitbox itself,
+-- scales the mesh to the hitbox length and puts the wheels on the ground.
+CarConfig.FIT_MESH_TO_HITBOX = true   -- false = use the template's own "Hitbox" part as placed
+CarConfig.MESH_LENGTH_FIT = 1.0       -- mesh length as a fraction of hitbox length
+CarConfig.MESH_OFFSET = Vector3.new(0, 0, 0) -- studs, nudges the mesh (X right, Y up, Z back)
+CarConfig.MESH_YAW_OFFSET = 180       -- degrees; only used if the mesh has no front/back wheel parts to find its nose
+
+-- Which RL hitbox each Car Kit body uses (closest shape). Anything missing uses HITBOX_PRESET.
+CarConfig.TEMPLATE_HITBOXES = {
+	race = "Octane",
+	["race-future"] = "Breakout",
+	["sedan-sports"] = "Dominus",
+	["hatchback-sports"] = "Hybrid",
+	sedan = "Octane",
+	police = "Dominus",
+	taxi = "Merc",
+	suv = "Merc",
+	["suv-luxury"] = "Merc",
+	van = "Merc",
+	truck = "Merc",
+	["truck-flat"] = "Plank",
+	["kart-oobi"] = "Octane",
+	["kart-oodi"] = "Octane",
+	["kart-ooli"] = "Octane",
+	["kart-oopi"] = "Octane",
+	["kart-oozi"] = "Octane",
+}
 CarConfig.SPAWN_HEIGHT = 3            -- studs above a spawn part (or origin) to drop the car
 CarConfig.KILL_Y = -200               -- studs; car respawns if it falls below this
 
@@ -197,6 +225,10 @@ local function log(...)
 	end
 end
 
+local templatePreset = CarConfig.TEMPLATE_HITBOXES[CarConfig.CAR_TEMPLATE_NAME]
+if templatePreset then
+	CarConfig.HITBOX_PRESET = templatePreset
+end
 if not CarConfig.HITBOXES[CarConfig.HITBOX_PRESET] then
 	warn("[CARCONFIG] unknown HITBOX_PRESET", CarConfig.HITBOX_PRESET, "- using Octane")
 	CarConfig.HITBOX_PRESET = "Octane"

@@ -10,8 +10,10 @@
 	CarInput; this script decides what the car actually does.
 
 	Needs: ReplicatedStorage > RLShared, ReplicatedStorage > CarConfig.
-	Optional: ServerStorage > CarTemplates > <CarConfig.CAR_TEMPLATE_NAME> (a Model;
-	a part named "Hitbox" is used if present, everything else is welded on as visuals).
+	Optional: ServerStorage > CarTemplates > <CarConfig.CAR_TEMPLATE_NAME> (a Model, e.g. an
+	imported Car Kit .glb). With CarConfig.FIT_MESH_TO_HITBOX the mesh is scaled to the hitbox,
+	its nose is found from its wheel parts and a Hitbox is built for it. Otherwise a part named
+	"Hitbox" is used if present. Everything else is welded on as visuals.
 	Optional: Workspace > CarSpawns (Parts; each part's front face = car forward;
 	attribute Team = "Blue"/"Orange" picks which team spawns there).
 	Other server scripts add boost with ServerStorage > CarEvents > AddBoost:Fire(carModel, amount).
@@ -161,11 +163,95 @@ local function buildPlaceholder(): Model
 	return model
 end
 
+-- Nose direction of a mesh car from its wheel parts (names like "wheel-front-left").
+local function findMeshForward(model: Model): Vector3?
+	local front, back, nf, nb = Vector3.zero, Vector3.zero, 0, 0
+	for _, part in model:GetDescendants() do
+		if part:IsA("BasePart") then
+			local n = part.Name:lower()
+			if n:find("wheel") and (n:find("left") or n:find("right")) then
+				if n:find("front") then
+					front += part.Position
+					nf += 1
+				elseif n:find("back") or n:find("rear") then
+					back += part.Position
+					nb += 1
+				end
+			end
+		end
+	end
+	if nf == 0 or nb == 0 then
+		return nil
+	end
+	local d = front / nf - back / nb
+	d = Vector3.new(d.X, 0, d.Z)
+	return if d.Magnitude > 1e-3 then d.Unit else nil
+end
+
+-- Box around every part of a model, measured in the axes of frame.
+local function boundsInFrame(model: Model, frame: CFrame): (CFrame, Vector3)
+	local minV, maxV = Vector3.one * math.huge, -Vector3.one * math.huge
+	for _, part in model:GetDescendants() do
+		if part:IsA("BasePart") then
+			local half = part.Size / 2
+			for _, sx in { -1, 1 } do
+				for _, sy in { -1, 1 } do
+					for _, sz in { -1, 1 } do
+						local corner = frame:PointToObjectSpace(part.CFrame:PointToWorldSpace(half * Vector3.new(sx, sy, sz)))
+						minV = minV:Min(corner)
+						maxV = maxV:Max(corner)
+					end
+				end
+			end
+		end
+	end
+	return frame * CFrame.new((minV + maxV) / 2), maxV - minV
+end
+
+-- Scales a mesh car to the hitbox length, sits its wheels on the ground and builds its Hitbox.
+local function fitMeshToHitbox(model: Model)
+	for _, old in model:GetDescendants() do
+		if old.Name == "Hitbox" and old:IsA("BasePart") then
+			old:Destroy()
+		end
+	end
+	model.PrimaryPart = nil
+
+	local pivotPos = model:GetPivot().Position
+	local forward = findMeshForward(model)
+	if not forward then
+		local look = (model:GetPivot() * CFrame.Angles(0, math.rad(C.MESH_YAW_OFFSET), 0)).LookVector
+		forward = Vector3.new(look.X, 0, look.Z)
+		forward = if forward.Magnitude > 1e-3 then forward.Unit else Vector3.new(0, 0, -1)
+		log("mesh has no front/back wheels, using MESH_YAW_OFFSET")
+	end
+	local frame = CFrame.lookAt(pivotPos, pivotPos + forward)
+	model.WorldPivot = frame
+
+	local _, size = boundsInFrame(model, frame)
+	if size.Z > 1e-3 then
+		model:ScaleTo(model:GetScale() * HITBOX_SIZE.Z * C.MESH_LENGTH_FIT / size.Z)
+	end
+
+	local boxCF, boxSize = boundsInFrame(model, model:GetPivot())
+	local hitbox = Instance.new("Part")
+	hitbox.Name = "Hitbox"
+	hitbox.Size = HITBOX_SIZE
+	hitbox.CFrame = boxCF * CFrame.new(0, -boxSize.Y / 2 + RIDE_HEIGHT, 0) * CFrame.new(-C.MESH_OFFSET)
+	hitbox.Parent = model
+	model.PrimaryPart = hitbox
+	log("fitted mesh", model.Name, "length", string.format("%.2f", boxSize.Z), "studs")
+end
+
 local function getTemplate(): Model
 	local templates = ServerStorage:FindFirstChild(RLShared.FOLDERS.CAR_TEMPLATES)
 	local template = templates and templates:FindFirstChild(C.CAR_TEMPLATE_NAME)
 	if template and template:IsA("Model") then
 		local model = template:Clone()
+		if C.FIT_MESH_TO_HITBOX then
+			fitMeshToHitbox(model)
+			return model
+		end
 		local hitbox = model:FindFirstChild("Hitbox", true)
 		if not (hitbox and hitbox:IsA("BasePart")) then
 			hitbox = Instance.new("Part")
