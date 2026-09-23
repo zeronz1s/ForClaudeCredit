@@ -1,0 +1,238 @@
+--[[
+	Name:     CarConfig
+	Class:    ModuleScript
+	Parent:   ReplicatedStorage > CarConfig
+
+	Every tunable number for the car: physics (server) plus keybinds and camera
+	(client). Physics values are Rocket League's own numbers in uu (unreal units)
+	and are converted to studs by CarController using RLShared.uu().
+	Sources: RLBot wiki / RLUtilities measurements of RL car physics.
+]]
+
+local CarConfig = {}
+
+----------------------------------------------------------------------
+-- CONFIG: general
+----------------------------------------------------------------------
+CarConfig.DEBUG = false
+
+CarConfig.DISABLE_CHARACTERS = true   -- players are cars; no R6 body spawns
+CarConfig.SHOW_HITBOX = false         -- true = draw the hitbox as a translucent box
+CarConfig.CAR_TEMPLATE_NAME = "race"  -- ServerStorage > CarTemplates > <this>, built-in placeholder if missing
+CarConfig.HITBOX_PRESET = "Octane"    -- key into HITBOXES below (TEMPLATE_HITBOXES overrides it per car)
+
+-- Mesh car bodies (Car Kit .glb imports). The controller builds the hitbox itself,
+-- scales the mesh to the hitbox length and puts the wheels on the ground.
+CarConfig.FIT_MESH_TO_HITBOX = true   -- false = use the template's own "Hitbox" part as placed
+CarConfig.MESH_LENGTH_FIT = 1.0       -- mesh length as a fraction of hitbox length
+CarConfig.MESH_OFFSET = Vector3.new(0, 0, 0) -- studs, nudges the mesh (X right, Y up, Z back)
+CarConfig.MESH_YAW_OFFSET = 180       -- degrees; only used if the mesh has no front/back wheel parts to find its nose
+
+-- Which RL hitbox each Car Kit body uses (closest shape). Anything missing uses HITBOX_PRESET.
+CarConfig.TEMPLATE_HITBOXES = {
+	race = "Octane",
+	["race-future"] = "Breakout",
+	["sedan-sports"] = "Dominus",
+	["hatchback-sports"] = "Hybrid",
+	sedan = "Octane",
+	police = "Dominus",
+	taxi = "Merc",
+	suv = "Merc",
+	["suv-luxury"] = "Merc",
+	van = "Merc",
+	truck = "Merc",
+	["truck-flat"] = "Plank",
+	["kart-oobi"] = "Octane",
+	["kart-oodi"] = "Octane",
+	["kart-ooli"] = "Octane",
+	["kart-oopi"] = "Octane",
+	["kart-oozi"] = "Octane",
+}
+CarConfig.SPAWN_HEIGHT = 3            -- studs above a spawn part (or origin) to drop the car
+CarConfig.KILL_Y = -200               -- studs; car respawns if it falls below this
+
+-- Physics density of the hitbox. RL car mass is 180 vs ball 30 (6:1); the ball
+-- system picks its own density to keep that ratio.
+CarConfig.HITBOX_DENSITY = 5
+CarConfig.HITBOX_FRICTION = 0         -- 0 so wall scrapes don't grab; grip is simulated in code
+CarConfig.HITBOX_ELASTICITY = 0
+
+----------------------------------------------------------------------
+-- CONFIG: hitboxes (uu). Size = length (forward), width, height.
+-- Values are RL's official hitbox dimensions.
+----------------------------------------------------------------------
+CarConfig.HITBOXES = {
+	Octane   = { length = 118.01, width = 84.20, height = 36.16 },
+	Dominus  = { length = 127.93, width = 83.28, height = 31.30 },
+	Plank    = { length = 128.82, width = 84.67, height = 29.39 },
+	Breakout = { length = 131.49, width = 80.52, height = 30.30 },
+	Hybrid   = { length = 127.02, width = 82.19, height = 34.16 },
+	Merc     = { length = 120.72, width = 76.71, height = 41.66 },
+}
+
+----------------------------------------------------------------------
+-- CONFIG: speeds and ground driving (uu, uu/s, uu/s^2)
+----------------------------------------------------------------------
+CarConfig.MAX_SPEED = 2300            -- absolute cap
+CarConfig.SUPERSONIC_SPEED = 2200     -- attribute Supersonic turns on at this speed
+CarConfig.MAX_THROTTLE_SPEED = 1410   -- throttle alone can't push past this
+
+-- Throttle acceleration by forward speed: {speed, accel}. Linear between points.
+CarConfig.THROTTLE_CURVE = {
+	{ 0, 1600 },
+	{ 1400, 160 },
+	{ 1410, 0 },
+}
+CarConfig.BRAKE_ACCEL = 3500          -- throttle opposite to motion
+CarConfig.COAST_ACCEL = 525           -- no throttle
+CarConfig.REVERSE_SPEED_MULT = 1      -- reverse uses the same curve
+
+-- Steering: max path curvature (1/uu) by forward speed. Linear between points.
+-- turn radius = 1 / curvature
+CarConfig.STEER_CURVE = {
+	{ 0, 0.00690 },
+	{ 500, 0.00398 },
+	{ 1000, 0.00235 },
+	{ 1500, 0.001375 },
+	{ 1750, 0.00110 },
+	{ 2300, 0.00088 },
+}
+CarConfig.POWERSLIDE_TURN_MULT = 1.4  -- handbrake tightens the turn
+
+-- Sideways grip: fraction of sideways velocity removed per second.
+CarConfig.GRIP = 18
+CarConfig.POWERSLIDE_GRIP = 1.5       -- handbrake held
+CarConfig.POWERSLIDE_GRIP_RECOVER = 4 -- per second, how fast grip comes back after releasing
+
+----------------------------------------------------------------------
+-- CONFIG: suspension and surface sticking (uu unless noted)
+----------------------------------------------------------------------
+CarConfig.RIDE_HEIGHT = 37.76         -- hitbox center above the surface at rest (Octane)
+CarConfig.SUSPENSION_REACH = 14       -- how far past ride height the wheels still count as touching
+CarConfig.SPRING_STIFFNESS = 600      -- 1/s^2, per stud of compression
+CarConfig.SPRING_DAMPING = 32         -- 1/s
+CarConfig.STICKY_ACCEL = 325          -- pull toward the surface while grounded (lets you drive walls)
+CarConfig.WHEEL_INSET_X = 0.8         -- wheel rays at this fraction of half-width
+CarConfig.WHEEL_INSET_Z = 0.75        -- and this fraction of half-length
+CarConfig.WHEELS_FOR_GROUNDED = 3     -- RL counts the car as grounded with 3+ wheels down
+CarConfig.ALIGN_RATE = 12             -- 1/s, how hard the car rotates to match the surface
+
+----------------------------------------------------------------------
+-- CONFIG: boost
+----------------------------------------------------------------------
+CarConfig.BOOST_START = 33
+CarConfig.BOOST_MAX = 100
+CarConfig.BOOST_USE_PER_SEC = 33.3
+CarConfig.BOOST_ACCEL = 991.666       -- uu/s^2, ground and air
+CarConfig.BOOST_MIN_TIME = 0.1        -- seconds, a tap always boosts at least this long
+CarConfig.UNLIMITED_BOOST = false     -- freeplay helper
+
+----------------------------------------------------------------------
+-- CONFIG: jumping and dodges
+----------------------------------------------------------------------
+CarConfig.JUMP_IMPULSE = 291.667      -- uu/s along car up, first and double jump
+CarConfig.JUMP_HOLD_ACCEL = 1458.333  -- uu/s^2 extra while jump is held
+CarConfig.JUMP_HOLD_TIME = 0.2        -- seconds the hold bonus lasts
+CarConfig.JUMP_GROUND_IGNORE = 0.1    -- seconds after a jump before the wheels can re-ground
+CarConfig.SECOND_JUMP_WINDOW = 1.25   -- seconds after the first jump to double jump or dodge
+CarConfig.FLIP_IF_NO_JUMP = true      -- drove off a ledge without jumping: flip stays available until landing
+
+CarConfig.DODGE_DEADZONE = 0.5        -- stick magnitude that turns a second jump into a dodge
+CarConfig.DODGE_IMPULSE = 500         -- uu/s horizontal
+CarConfig.DODGE_BACK_MULT = 16 / 15   -- backflips are a bit stronger
+CarConfig.DODGE_BACK_SPEED_SCALE = 1.5  -- backflip impulse grows with speed: *(1 + this * speed/2300)
+CarConfig.DODGE_SIDE_SPEED_SCALE = 0.9  -- sideflip impulse grows with speed: *(1 + this * speed/2300)
+CarConfig.DODGE_TORQUE_TIME = 0.65    -- seconds the flip spin is forced
+CarConfig.DODGE_SPIN = 5.5            -- rad/s flip spin
+CarConfig.DODGE_CANCEL_FALL = true    -- falling speed is zeroed when a dodge starts
+CarConfig.DODGE_FLOAT_TIME = 0.15     -- seconds after a dodge where gravity can't pull the car down
+CarConfig.FLIP_CANCEL = true          -- pulling back during a front flip stops the spin
+
+CarConfig.TURTLE_JUMP_IMPULSE = 300   -- uu/s up when jumping from on the roof
+CarConfig.TURTLE_RIGHTING_TIME = 0.45 -- seconds to rotate back onto the wheels after a roof jump
+
+----------------------------------------------------------------------
+-- CONFIG: air control (rad/s^2 torque per full input, damping per second)
+----------------------------------------------------------------------
+CarConfig.AIR_PITCH_TORQUE = 12.146
+CarConfig.AIR_YAW_TORQUE = 8.920
+CarConfig.AIR_ROLL_TORQUE = 36.080
+CarConfig.AIR_PITCH_DAMP = 2.798      -- scaled by (1 - |pitch input|)
+CarConfig.AIR_YAW_DAMP = 1.886        -- scaled by (1 - |yaw input|)
+CarConfig.AIR_ROLL_DAMP = 4.472       -- always on
+CarConfig.AIR_THROTTLE_ACCEL = 66.667 -- uu/s^2 forward/back from throttle while airborne
+CarConfig.MAX_ANGULAR_SPEED = 5.5     -- rad/s
+
+----------------------------------------------------------------------
+-- CONFIG: networking (server-authoritative input)
+----------------------------------------------------------------------
+CarConfig.INPUT_SEND_RATE = 60        -- client packets per second
+CarConfig.INPUT_MAX_RATE = 90         -- server drops packets above this per second
+CarConfig.INPUT_TIMEOUT = 0.5         -- seconds without a packet before inputs reset to zero
+
+----------------------------------------------------------------------
+-- CONFIG: client controls. Any key in a list works.
+----------------------------------------------------------------------
+CarConfig.KEYS = {
+	THROTTLE = { Enum.KeyCode.W, Enum.KeyCode.Up },
+	REVERSE = { Enum.KeyCode.S, Enum.KeyCode.Down },
+	STEER_LEFT = { Enum.KeyCode.A, Enum.KeyCode.Left },
+	STEER_RIGHT = { Enum.KeyCode.D, Enum.KeyCode.Right },
+	JUMP = { Enum.KeyCode.Space, Enum.KeyCode.ButtonA },
+	BOOST = { Enum.KeyCode.LeftControl, Enum.KeyCode.ButtonB },
+	POWERSLIDE = { Enum.KeyCode.LeftShift, Enum.KeyCode.ButtonX }, -- also free air roll
+	AIR_ROLL_LEFT = { Enum.KeyCode.Q, Enum.KeyCode.ButtonL1 },
+	AIR_ROLL_RIGHT = { Enum.KeyCode.E, Enum.KeyCode.ButtonR1 },
+	BALL_CAM = { Enum.KeyCode.Y, Enum.KeyCode.ButtonY },
+}
+CarConfig.MOUSE_BOOST = true          -- left mouse boosts (RL default)
+CarConfig.MOUSE_JUMP = true           -- right mouse jumps (RL default)
+CarConfig.GAMEPAD_DEADZONE = 0.12
+CarConfig.KEYBOARD_PITCH_FROM_THROTTLE = true -- W/S pitch in the air like RL
+
+----------------------------------------------------------------------
+-- CONFIG: camera (RL-style defaults, uu converted by the client)
+----------------------------------------------------------------------
+CarConfig.CAMERA_FOV = 77.5           -- Roblox vertical FOV; equals RL's 110 horizontal on 16:9
+CarConfig.CAMERA_DISTANCE = 270       -- uu behind the car
+CarConfig.CAMERA_HEIGHT = 100         -- uu above the car
+CarConfig.CAMERA_ANGLE = -4           -- degrees of downward tilt
+CarConfig.CAMERA_SHARPNESS = 10       -- 1/s, higher = stiffer follow
+CarConfig.BALL_CAM_DEFAULT = true     -- start in ball cam if a ball exists
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+
+-- Linear lookup in a {{x, y}, ...} table, clamped at both ends.
+function CarConfig.curve(points, x: number): number
+	if x <= points[1][1] then
+		return points[1][2]
+	end
+	for i = 2, #points do
+		local a, b = points[i - 1], points[i]
+		if x <= b[1] then
+			local t = (x - a[1]) / (b[1] - a[1])
+			return a[2] + (b[2] - a[2]) * t
+		end
+	end
+	return points[#points][2]
+end
+
+local function log(...)
+	if CarConfig.DEBUG then
+		print("[CARCONFIG]", ...)
+	end
+end
+
+local templatePreset = CarConfig.TEMPLATE_HITBOXES[CarConfig.CAR_TEMPLATE_NAME]
+if templatePreset then
+	CarConfig.HITBOX_PRESET = templatePreset
+end
+if not CarConfig.HITBOXES[CarConfig.HITBOX_PRESET] then
+	warn("[CARCONFIG] unknown HITBOX_PRESET", CarConfig.HITBOX_PRESET, "- using Octane")
+	CarConfig.HITBOX_PRESET = "Octane"
+end
+log("loaded, hitbox preset =", CarConfig.HITBOX_PRESET)
+
+return CarConfig

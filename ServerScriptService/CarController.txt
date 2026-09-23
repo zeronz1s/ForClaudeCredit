@@ -1,0 +1,908 @@
+--[[
+	Name:     CarController
+	Class:    Script
+	Parent:   ServerScriptService > CarController
+
+	Server-authoritative Rocket League car. Spawns one car per player, owns every
+	car's physics, and simulates driving, powerslide, boost, jump, double jump,
+	dodges (flips), air control and air roll from the inputs clients send.
+	Clients only send stick/button state through ReplicatedStorage > Remotes >
+	CarInput; this script decides what the car actually does.
+
+	Needs: ReplicatedStorage > RLShared, ReplicatedStorage > CarConfig.
+	Optional: ServerStorage > CarTemplates > <CarConfig.CAR_TEMPLATE_NAME> (a Model, e.g. an
+	imported Car Kit .glb). With CarConfig.FIT_MESH_TO_HITBOX the mesh is scaled to the hitbox,
+	its nose is found from its wheel parts and a Hitbox is built for it. Otherwise a part named
+	"Hitbox" is used if present. Everything else is welded on as visuals.
+	Optional: Workspace > CarSpawns (Parts; each part's front face = car forward;
+	attribute Team = "Blue"/"Orange" picks which team spawns there).
+	Other server scripts add boost with ServerStorage > CarEvents > AddBoost:Fire(carModel, amount).
+]]
+
+----------------------------------------------------------------------
+-- CONFIG (car physics numbers live in ReplicatedStorage > CarConfig)
+----------------------------------------------------------------------
+local DEBUG = false
+local LOG_INPUT_REJECTS = true   -- warn when a client sends junk input
+local MAX_JUMPS_PER_PACKET = 4   -- ignore jump counter jumps bigger than this
+
+----------------------------------------------------------------------
+-- Services and modules
+----------------------------------------------------------------------
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local CollectionService = game:GetService("CollectionService")
+
+local RLShared = require(ReplicatedStorage:WaitForChild("RLShared"))
+local C = require(ReplicatedStorage:WaitForChild("CarConfig"))
+
+local function log(...)
+	if DEBUG then
+		print("[CAR]", ...)
+	end
+end
+
+local uu = RLShared.uu
+local toUU = RLShared.toUU
+
+----------------------------------------------------------------------
+-- Converted constants (studs)
+----------------------------------------------------------------------
+local HITBOX = C.HITBOXES[C.HITBOX_PRESET]
+local HITBOX_SIZE = Vector3.new(uu(HITBOX.width), uu(HITBOX.height), uu(HITBOX.length))
+
+local MAX_SPEED = uu(C.MAX_SPEED)
+local RIDE_HEIGHT = uu(C.RIDE_HEIGHT)
+local RAY_LENGTH = uu(C.RIDE_HEIGHT + C.SUSPENSION_REACH)
+local STICKY = uu(C.STICKY_ACCEL)
+local BOOST_ACCEL = uu(C.BOOST_ACCEL)
+local AIR_THROTTLE_ACCEL = uu(C.AIR_THROTTLE_ACCEL)
+local JUMP_IMPULSE = uu(C.JUMP_IMPULSE)
+local JUMP_HOLD_ACCEL = uu(C.JUMP_HOLD_ACCEL)
+local DODGE_IMPULSE = uu(C.DODGE_IMPULSE)
+local TURTLE_JUMP_IMPULSE = uu(C.TURTLE_JUMP_IMPULSE)
+
+local FLAG_BOOST = 1
+local FLAG_HANDBRAKE = 2
+local FLAG_AIR_ROLL = 4
+local FLAG_JUMP_HELD = 8
+
+----------------------------------------------------------------------
+-- World setup
+----------------------------------------------------------------------
+workspace.Gravity = RLShared.GRAVITY
+
+if C.DISABLE_CHARACTERS then
+	Players.CharacterAutoLoads = false
+end
+
+local remotes = RLShared.getOrCreate(ReplicatedStorage, "Folder", RLShared.FOLDERS.REMOTES)
+local inputRemote = RLShared.getOrCreate(remotes, "UnreliableRemoteEvent", RLShared.REMOTES.CAR_INPUT)
+local spawnedRemote = RLShared.getOrCreate(remotes, "RemoteEvent", RLShared.REMOTES.CAR_SPAWNED)
+local carsFolder = RLShared.getOrCreate(workspace, "Folder", RLShared.FOLDERS.CARS)
+local carEvents = RLShared.getOrCreate(ServerStorage, "Folder", RLShared.FOLDERS.CAR_EVENTS)
+local addBoostEvent = RLShared.getOrCreate(carEvents, "BindableEvent", RLShared.CAR_EVENTS.ADD_BOOST) :: BindableEvent
+
+-- Wheel rays ignore every car, the ball and anything tagged NotDrivable.
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+rayParams.RespectCanCollide = true
+
+local function rebuildRayFilter()
+	local list = { carsFolder }
+	for _, tag in { RLShared.TAGS.BALL, RLShared.TAGS.NOT_DRIVABLE } do
+		for _, inst in CollectionService:GetTagged(tag) do
+			table.insert(list, inst)
+		end
+	end
+	for _, plr in Players:GetPlayers() do
+		if plr.Character then
+			table.insert(list, plr.Character)
+		end
+	end
+	rayParams.FilterDescendantsInstances = list
+end
+
+for _, tag in { RLShared.TAGS.BALL, RLShared.TAGS.NOT_DRIVABLE } do
+	CollectionService:GetInstanceAddedSignal(tag):Connect(rebuildRayFilter)
+	CollectionService:GetInstanceRemovedSignal(tag):Connect(rebuildRayFilter)
+end
+rebuildRayFilter()
+
+----------------------------------------------------------------------
+-- Car building
+----------------------------------------------------------------------
+local function makeVisual(parent: Instance, name: string, size: Vector3, offset: CFrame, color: Color3, shape: Enum.PartType?)
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Size = size
+	p.CFrame = offset
+	p.Color = color
+	p.Material = Enum.Material.SmoothPlastic
+	if shape then
+		p.Shape = shape
+	end
+	p.Parent = parent
+	return p
+end
+
+-- Placeholder car (used when there is no template). Built around a hitbox at the origin.
+local function buildPlaceholder(): Model
+	local model = Instance.new("Model")
+	model.Name = "Octane"
+
+	local hitbox = Instance.new("Part")
+	hitbox.Name = "Hitbox"
+	hitbox.Size = HITBOX_SIZE
+	hitbox.CFrame = CFrame.new()
+	hitbox.Parent = model
+
+	local w, h, l = HITBOX_SIZE.X, HITBOX_SIZE.Y, HITBOX_SIZE.Z
+	local body = Color3.fromRGB(35, 110, 230)
+	makeVisual(model, "Body", Vector3.new(w * 0.95, h * 0.6, l), CFrame.new(0, -h * 0.1, 0), body)
+	makeVisual(model, "Cabin", Vector3.new(w * 0.75, h * 0.55, l * 0.45), CFrame.new(0, h * 0.45, l * 0.1), Color3.fromRGB(25, 25, 30))
+	makeVisual(model, "Spoiler", Vector3.new(w * 0.9, h * 0.1, l * 0.12), CFrame.new(0, h * 0.55, l * 0.45), body)
+
+	local wheelColor = Color3.fromRGB(20, 20, 20)
+	local frontR, backR = uu(12.5), uu(15)
+	for _, wheel in {
+		{ "WheelFL", -1, -l * 0.35, frontR },
+		{ "WheelFR", 1, -l * 0.35, frontR },
+		{ "WheelBL", -1, l * 0.33, backR },
+		{ "WheelBR", 1, l * 0.33, backR },
+	} do
+		local name, side, z, r = wheel[1], wheel[2], wheel[3], wheel[4]
+		makeVisual(model, name, Vector3.new(uu(12), r * 2, r * 2),
+			CFrame.new(side * w * 0.45, -RIDE_HEIGHT + r, z), wheelColor, Enum.PartType.Cylinder)
+	end
+
+	model.PrimaryPart = hitbox
+	return model
+end
+
+-- Nose direction of a mesh car from its wheel parts (names like "wheel-front-left").
+local function findMeshForward(model: Model): Vector3?
+	local front, back, nf, nb = Vector3.zero, Vector3.zero, 0, 0
+	for _, part in model:GetDescendants() do
+		if part:IsA("BasePart") then
+			local n = part.Name:lower()
+			if n:find("wheel") and (n:find("left") or n:find("right")) then
+				if n:find("front") then
+					front += part.Position
+					nf += 1
+				elseif n:find("back") or n:find("rear") then
+					back += part.Position
+					nb += 1
+				end
+			end
+		end
+	end
+	if nf == 0 or nb == 0 then
+		return nil
+	end
+	local d = front / nf - back / nb
+	d = Vector3.new(d.X, 0, d.Z)
+	return if d.Magnitude > 1e-3 then d.Unit else nil
+end
+
+-- Box around every part of a model, measured in the axes of frame.
+local function boundsInFrame(model: Model, frame: CFrame): (CFrame, Vector3)
+	local minV, maxV = Vector3.one * math.huge, -Vector3.one * math.huge
+	for _, part in model:GetDescendants() do
+		if part:IsA("BasePart") then
+			local half = part.Size / 2
+			for _, sx in { -1, 1 } do
+				for _, sy in { -1, 1 } do
+					for _, sz in { -1, 1 } do
+						local corner = frame:PointToObjectSpace(part.CFrame:PointToWorldSpace(half * Vector3.new(sx, sy, sz)))
+						minV = minV:Min(corner)
+						maxV = maxV:Max(corner)
+					end
+				end
+			end
+		end
+	end
+	return frame * CFrame.new((minV + maxV) / 2), maxV - minV
+end
+
+-- Scales a mesh car to the hitbox length, sits its wheels on the ground and builds its Hitbox.
+local function fitMeshToHitbox(model: Model)
+	for _, old in model:GetDescendants() do
+		if old.Name == "Hitbox" and old:IsA("BasePart") then
+			old:Destroy()
+		end
+	end
+	model.PrimaryPart = nil
+
+	local pivotPos = model:GetPivot().Position
+	local forward = findMeshForward(model)
+	if not forward then
+		local look = (model:GetPivot() * CFrame.Angles(0, math.rad(C.MESH_YAW_OFFSET), 0)).LookVector
+		forward = Vector3.new(look.X, 0, look.Z)
+		forward = if forward.Magnitude > 1e-3 then forward.Unit else Vector3.new(0, 0, -1)
+		log("mesh has no front/back wheels, using MESH_YAW_OFFSET")
+	end
+	local frame = CFrame.lookAt(pivotPos, pivotPos + forward)
+	model.WorldPivot = frame
+
+	local _, size = boundsInFrame(model, frame)
+	if size.Z > 1e-3 then
+		model:ScaleTo(model:GetScale() * HITBOX_SIZE.Z * C.MESH_LENGTH_FIT / size.Z)
+	end
+
+	local boxCF, boxSize = boundsInFrame(model, model:GetPivot())
+	local hitbox = Instance.new("Part")
+	hitbox.Name = "Hitbox"
+	hitbox.Size = HITBOX_SIZE
+	hitbox.CFrame = boxCF * CFrame.new(0, -boxSize.Y / 2 + RIDE_HEIGHT, 0) * CFrame.new(-C.MESH_OFFSET)
+	hitbox.Parent = model
+	model.PrimaryPart = hitbox
+	log("fitted mesh", model.Name, "length", string.format("%.2f", boxSize.Z), "studs")
+end
+
+local function getTemplate(): Model
+	local templates = ServerStorage:FindFirstChild(RLShared.FOLDERS.CAR_TEMPLATES)
+	local template = templates and templates:FindFirstChild(C.CAR_TEMPLATE_NAME)
+	if template and template:IsA("Model") then
+		local model = template:Clone()
+		if C.FIT_MESH_TO_HITBOX then
+			fitMeshToHitbox(model)
+			return model
+		end
+		local hitbox = model:FindFirstChild("Hitbox", true)
+		if not (hitbox and hitbox:IsA("BasePart")) then
+			hitbox = Instance.new("Part")
+			hitbox.Name = "Hitbox"
+			hitbox.CFrame = model:GetPivot()
+			hitbox.Parent = model
+			log("template has no Hitbox part, made one at its pivot")
+		end
+		model.PrimaryPart = hitbox
+		return model
+	end
+	log("no template", C.CAR_TEMPLATE_NAME, "- using placeholder")
+	return buildPlaceholder()
+end
+
+-- Turns any model into a drivable car: one colliding hitbox, everything else welded visuals.
+local function prepareCar(model: Model, player: Player, team: string): BasePart
+	local hitbox = model.PrimaryPart :: BasePart
+	hitbox.Size = HITBOX_SIZE
+	hitbox.Anchored = false
+	hitbox.CanCollide = true
+	hitbox.CanQuery = true
+	hitbox.CanTouch = true
+	hitbox.Massless = false
+	hitbox.Transparency = C.SHOW_HITBOX and 0.6 or 1
+	hitbox.CustomPhysicalProperties = PhysicalProperties.new(
+		C.HITBOX_DENSITY, C.HITBOX_FRICTION, C.HITBOX_ELASTICITY, 100, 100)
+
+	for _, part in model:GetDescendants() do
+		if part:IsA("BasePart") and part ~= hitbox then
+			part.Anchored = false
+			part.CanCollide = false
+			part.CanQuery = false
+			part.CanTouch = false
+			part.Massless = true
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0 = hitbox
+			weld.Part1 = part
+			weld.Parent = part
+		end
+	end
+
+	-- Boost flame at the back of the hitbox
+	local att = Instance.new("Attachment")
+	att.Name = "BoostAttachment"
+	att.Position = Vector3.new(0, 0, HITBOX_SIZE.Z / 2)
+	att.Orientation = Vector3.new(0, 180, 0)
+	att.Parent = hitbox
+	local flame = Instance.new("ParticleEmitter")
+	flame.Name = "BoostFlame"
+	flame.Enabled = false
+	flame.Rate = 120
+	flame.Lifetime = NumberRange.new(0.12, 0.2)
+	flame.Speed = NumberRange.new(20, 25)
+	flame.EmissionDirection = Enum.NormalId.Front
+	flame.SpreadAngle = Vector2.new(8, 8)
+	flame.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.6), NumberSequenceKeypoint.new(1, 0) })
+	flame.Color = ColorSequence.new(Color3.fromRGB(255, 220, 120), Color3.fromRGB(255, 90, 20))
+	flame.LightEmission = 1
+	flame.Parent = att
+
+	model.Name = tostring(player.UserId)
+	model.ModelStreamingMode = Enum.ModelStreamingMode.Persistent
+	CollectionService:AddTag(model, RLShared.TAGS.CAR)
+	CollectionService:AddTag(hitbox, RLShared.TAGS.CAR_HITBOX)
+	model:SetAttribute("OwnerUserId", player.UserId)
+	model:SetAttribute("Team", team)
+	model:SetAttribute("Boost", C.BOOST_START)
+	model:SetAttribute("Boosting", false)
+	model:SetAttribute("Grounded", false)
+	model:SetAttribute("Supersonic", false)
+	model:SetAttribute("Dodging", false)
+	return hitbox
+end
+
+----------------------------------------------------------------------
+-- Car state
+----------------------------------------------------------------------
+local cars = {} -- [Player] = state
+local spawnIndex = {} -- [team] = last spawn used
+
+local function newInput()
+	return {
+		throttle = 0, steer = 0, pitch = 0, roll = 0,
+		boost = false, handbrake = false, airRoll = false, jumpHeld = false,
+	}
+end
+
+local function resetMotionState(st)
+	st.grounded = false
+	st.jumped = false
+	st.timeSinceJump = 0
+	st.jumpHolding = false
+	st.secondJumpUsed = false
+	st.airTime = 0
+	st.groundIgnore = 0
+	st.dodgeTime = nil
+	st.dodgeSpin = Vector3.zero
+	st.dodgeDirForward = 0
+	st.dodgeFloat = 0
+	st.rightingTime = 0
+	st.grip = C.GRIP
+	st.boostMinLeft = 0
+	st.boostWasHeld = false
+	st.pendingJump = false
+end
+
+-- Team from player.Team when it is Blue/Orange, otherwise the smaller team.
+local function pickTeam(player: Player): string
+	if player.Team and table.find(RLShared.TEAMS, player.Team.Name) then
+		return player.Team.Name
+	end
+	local counts = {}
+	for _, team in RLShared.TEAMS do
+		counts[team] = 0
+	end
+	for other, st in cars do
+		if other ~= player and counts[st.team] then
+			counts[st.team] += 1
+		end
+	end
+	local best = RLShared.TEAMS[1]
+	for _, team in RLShared.TEAMS do
+		if counts[team] < counts[best] then
+			best = team
+		end
+	end
+	return best
+end
+
+-- Spawn parts with a matching Team attribute first (sorted by KickoffIndex), else any spawn part.
+local function getSpawnCFrame(team: string): CFrame
+	local spawns = workspace:FindFirstChild(RLShared.FOLDERS.CAR_SPAWNS)
+	local teamParts, anyParts = {}, {}
+	if spawns then
+		for _, p in spawns:GetChildren() do
+			if p:IsA("BasePart") then
+				table.insert(anyParts, p)
+				if p:GetAttribute("Team") == team then
+					table.insert(teamParts, p)
+				end
+			end
+		end
+	end
+	local parts = if #teamParts > 0 then teamParts else anyParts
+	if #parts == 0 then
+		return CFrame.new(0, C.SPAWN_HEIGHT + RIDE_HEIGHT, 0)
+	end
+	table.sort(parts, function(a, b)
+		return (a:GetAttribute("KickoffIndex") or 99) < (b:GetAttribute("KickoffIndex") or 99)
+	end)
+	spawnIndex[team] = (spawnIndex[team] or 0) % #parts + 1
+	local p = parts[spawnIndex[team]]
+	return p.CFrame * CFrame.new(0, p.Size.Y / 2 + C.SPAWN_HEIGHT + RIDE_HEIGHT, 0)
+end
+
+local function placeCar(st)
+	st.model:PivotTo(getSpawnCFrame(st.team))
+	st.hitbox.AssemblyLinearVelocity = Vector3.zero
+	st.hitbox.AssemblyAngularVelocity = Vector3.zero
+	resetMotionState(st)
+	st.model:SetAttribute("Boost", C.BOOST_START)
+end
+
+local function despawnCar(player: Player)
+	local st = cars[player]
+	if st then
+		cars[player] = nil
+		if st.model then
+			st.model:Destroy()
+		end
+		log("despawned car for", player.Name)
+	end
+end
+
+local function spawnCar(player: Player)
+	despawnCar(player)
+	if C.DISABLE_CHARACTERS and player.Character then
+		player.Character:Destroy()
+	end
+
+	local team = pickTeam(player)
+	local model = getTemplate()
+	local hitbox = prepareCar(model, player, team)
+	local st = {
+		player = player,
+		team = team,
+		model = model,
+		hitbox = hitbox,
+		input = newInput(),
+		lastJumpCount = 0,
+		lastInputTime = 0,
+		packetWindowStart = os.clock(),
+		packetCount = 0,
+		attrCache = {},
+	}
+	resetMotionState(st)
+
+	model:PivotTo(getSpawnCFrame(team))
+	model.Parent = carsFolder
+	hitbox:SetNetworkOwner(nil) -- server owns the physics
+	cars[player] = st
+
+	spawnedRemote:FireClient(player, model)
+	log("spawned car for", player.Name, "team", team)
+end
+
+-- Boost pads (or anything else on the server) refill boost through this event.
+addBoostEvent.Event:Connect(function(model, amount)
+	if typeof(model) ~= "Instance" or not CollectionService:HasTag(model, RLShared.TAGS.CAR) then
+		return
+	end
+	if type(amount) ~= "number" or amount ~= amount then
+		return
+	end
+	local current = model:GetAttribute("Boost") or 0
+	model:SetAttribute("Boost", math.clamp(current + amount, 0, C.BOOST_MAX))
+	log(model.Name, "boost +", amount)
+end)
+
+----------------------------------------------------------------------
+-- Input (client requests, server decides)
+----------------------------------------------------------------------
+local function axis(x): number
+	if type(x) ~= "number" or x ~= x then
+		return 0
+	end
+	return math.clamp(x, -1, 1)
+end
+
+inputRemote.OnServerEvent:Connect(function(player, throttle, steer, pitch, roll, flags, jumpCount)
+	local st = cars[player]
+	if not st then
+		return
+	end
+
+	local now = os.clock()
+	if now - st.packetWindowStart >= 1 then
+		st.packetWindowStart = now
+		st.packetCount = 0
+	end
+	st.packetCount += 1
+	if st.packetCount > C.INPUT_MAX_RATE then
+		return
+	end
+
+	if type(flags) ~= "number" or flags ~= flags or type(jumpCount) ~= "number" or jumpCount ~= jumpCount then
+		if LOG_INPUT_REJECTS then
+			warn("[CAR] bad input packet from", player.Name)
+		end
+		return
+	end
+	flags = math.clamp(math.floor(flags), 0, 15)
+	jumpCount = math.floor(jumpCount) % 65536
+
+	local inp = st.input
+	inp.throttle = axis(throttle)
+	inp.steer = axis(steer)
+	inp.pitch = axis(pitch)
+	inp.roll = axis(roll)
+	inp.boost = bit32.btest(flags, FLAG_BOOST)
+	inp.handbrake = bit32.btest(flags, FLAG_HANDBRAKE)
+	inp.airRoll = bit32.btest(flags, FLAG_AIR_ROLL)
+	inp.jumpHeld = bit32.btest(flags, FLAG_JUMP_HELD)
+
+	-- Jump presses arrive as a counter so a dropped packet can't eat a tap.
+	local presses = (jumpCount - st.lastJumpCount) % 65536
+	st.lastJumpCount = jumpCount
+	if presses > 0 and presses <= MAX_JUMPS_PER_PACKET then
+		st.pendingJump = true
+	end
+
+	st.lastInputTime = now
+end)
+
+----------------------------------------------------------------------
+-- Physics helpers
+----------------------------------------------------------------------
+local function setAttr(st, name: string, value)
+	if st.attrCache[name] ~= value then
+		st.attrCache[name] = value
+		st.model:SetAttribute(name, value)
+	end
+end
+
+local function approachZero(value: number, amount: number): number
+	if value > 0 then
+		return math.max(0, value - amount)
+	end
+	return math.min(0, value + amount)
+end
+
+local function flat(v: Vector3): Vector3
+	return Vector3.new(v.X, 0, v.Z)
+end
+
+-- Casts the four wheel rays. Returns wheels touching, average normal, average distance.
+local function castWheels(cf: CFrame)
+	local hx = HITBOX_SIZE.X / 2 * C.WHEEL_INSET_X
+	local hz = HITBOX_SIZE.Z / 2 * C.WHEEL_INSET_Z
+	local down = -cf.UpVector * RAY_LENGTH
+	local count, normalSum, distSum = 0, Vector3.zero, 0
+	for _, offset in { Vector3.new(-hx, 0, -hz), Vector3.new(hx, 0, -hz), Vector3.new(-hx, 0, hz), Vector3.new(hx, 0, hz) } do
+		local result = workspace:Raycast(cf:PointToWorldSpace(offset), down, rayParams)
+		if result then
+			count += 1
+			normalSum += result.Normal
+			distSum += result.Distance
+		end
+	end
+	if count == 0 then
+		return 0, cf.UpVector, RAY_LENGTH
+	end
+	return count, normalSum.Unit, distSum / count
+end
+
+local function isOnRoof(cf: CFrame): boolean
+	if cf.UpVector.Y > -0.3 then
+		return false
+	end
+	local reach = HITBOX_SIZE.Y / 2 + uu(25)
+	return workspace:Raycast(cf.Position, cf.UpVector * reach, rayParams) ~= nil
+end
+
+local function updateBoost(st, inp, dt: number): boolean
+	local amount = st.model:GetAttribute("Boost") or 0
+	if inp.boost and not st.boostWasHeld then
+		st.boostMinLeft = C.BOOST_MIN_TIME
+	end
+	st.boostWasHeld = inp.boost
+	st.boostMinLeft = math.max(0, st.boostMinLeft - dt)
+
+	local active = (inp.boost or st.boostMinLeft > 0) and (amount > 0 or C.UNLIMITED_BOOST)
+	if active and not C.UNLIMITED_BOOST then
+		amount = math.max(0, amount - C.BOOST_USE_PER_SEC * dt)
+		st.model:SetAttribute("Boost", amount)
+	end
+	return active
+end
+
+----------------------------------------------------------------------
+-- Jumps and dodges
+----------------------------------------------------------------------
+local function doJump(st, cf: CFrame, v: Vector3): Vector3
+	st.jumped = true
+	st.timeSinceJump = 0
+	st.jumpHolding = true
+	st.groundIgnore = C.JUMP_GROUND_IGNORE
+	st.grounded = false
+	log(st.player.Name, "jump")
+	return v + cf.UpVector * JUMP_IMPULSE
+end
+
+local function doDodge(st, cf: CFrame, v: Vector3, forward: number, side: number): Vector3
+	local mag = math.sqrt(forward * forward + side * side)
+	forward, side = forward / mag, side / mag
+
+	local f = flat(cf.LookVector)
+	if f.Magnitude < 1e-3 then
+		f = flat(-cf.UpVector)
+	end
+	f = f.Unit
+	local r = f:Cross(Vector3.yAxis)
+
+	local s = math.abs(toUU(v:Dot(f))) / C.MAX_SPEED
+	local dvForward = DODGE_IMPULSE * forward
+	if forward < 0 then
+		dvForward *= C.DODGE_BACK_MULT * (1 + C.DODGE_BACK_SPEED_SCALE * s)
+	end
+	local dvSide = DODGE_IMPULSE * side * (1 + C.DODGE_SIDE_SPEED_SCALE * s)
+
+	v += f * dvForward + r * dvSide
+	if C.DODGE_CANCEL_FALL and v.Y < 0 then
+		v = Vector3.new(v.X, 0, v.Z)
+	end
+
+	-- Local spin: -X pitches the nose down, -Z rolls right.
+	st.dodgeSpin = Vector3.new(-forward * C.DODGE_SPIN, 0, -side * C.DODGE_SPIN)
+	st.dodgeDirForward = forward
+	st.dodgeTime = 0
+	st.dodgeFloat = C.DODGE_FLOAT_TIME
+	st.secondJumpUsed = true
+	log(st.player.Name, string.format("dodge fwd=%.2f side=%.2f", forward, side))
+	return v
+end
+
+local function handleJumpPress(st, cf: CFrame, v: Vector3, w: Vector3): (Vector3, Vector3)
+	local inp = st.input
+	if st.grounded then
+		return doJump(st, cf, v), w
+	end
+
+	if isOnRoof(cf) then
+		st.rightingTime = C.TURTLE_RIGHTING_TIME
+		log(st.player.Name, "roof jump")
+		return v + Vector3.yAxis * TURTLE_JUMP_IMPULSE, w
+	end
+
+	if st.secondJumpUsed then
+		return v, w
+	end
+	local inWindow
+	if st.jumped then
+		inWindow = st.timeSinceJump <= C.SECOND_JUMP_WINDOW
+	else
+		inWindow = C.FLIP_IF_NO_JUMP or st.airTime <= C.SECOND_JUMP_WINDOW
+	end
+	if not inWindow then
+		return v, w
+	end
+
+	local forward, side = inp.pitch, inp.steer
+	if math.sqrt(forward * forward + side * side) >= C.DODGE_DEADZONE then
+		return doDodge(st, cf, v, forward, side), w
+	end
+
+	st.secondJumpUsed = true
+	log(st.player.Name, "double jump")
+	return v + cf.UpVector * JUMP_IMPULSE, w
+end
+
+----------------------------------------------------------------------
+-- Ground and air simulation
+----------------------------------------------------------------------
+local function stepGround(st, cf: CFrame, v: Vector3, normal: Vector3, dist: number, boosting: boolean, dt: number): (Vector3, Vector3)
+	local inp = st.input
+	local fwd = cf.LookVector - normal * cf.LookVector:Dot(normal)
+	fwd = if fwd.Magnitude > 1e-3 then fwd.Unit else cf.LookVector
+	local right = fwd:Cross(normal)
+
+	local vF, vS, vN = toUU(v:Dot(fwd)), v:Dot(right), v:Dot(normal)
+
+	-- Throttle, brake, coast, boost (in uu)
+	local throttle = if boosting then 1 else inp.throttle
+	if throttle ~= 0 and vF * throttle < 0 then
+		vF = approachZero(vF, C.BRAKE_ACCEL * dt)
+	elseif throttle ~= 0 then
+		local mult = if throttle < 0 then C.REVERSE_SPEED_MULT else 1
+		vF += throttle * C.curve(C.THROTTLE_CURVE, math.abs(vF)) * mult * dt
+	else
+		vF = approachZero(vF, C.COAST_ACCEL * dt)
+	end
+	if boosting then
+		vF += C.BOOST_ACCEL * dt
+	end
+
+	-- Steering: yaw rate = speed * curvature(speed) * steer
+	local curvature = C.curve(C.STEER_CURVE, math.abs(vF))
+	if inp.handbrake then
+		curvature *= C.POWERSLIDE_TURN_MULT
+	end
+	local yawRate = -inp.steer * curvature * vF
+
+	-- Sideways grip (handbrake = powerslide)
+	if inp.handbrake then
+		st.grip = C.POWERSLIDE_GRIP
+	else
+		st.grip += (C.GRIP - st.grip) * math.min(1, C.POWERSLIDE_GRIP_RECOVER * dt)
+	end
+	vS *= math.max(0, 1 - st.grip * dt)
+
+	-- Suspension spring + sticky force along the surface normal
+	local compression = RIDE_HEIGHT - dist
+	local aN = (if compression > 0 then C.SPRING_STIFFNESS * compression else 0) - C.SPRING_DAMPING * vN - STICKY
+	vN += aN * dt
+
+	local newV = fwd * uu(vF) + right * vS + normal * vN
+
+	-- Rotate to match the surface, yaw from steering
+	local up = cf.UpVector
+	local axisVec = up:Cross(normal)
+	local sinA = axisVec.Magnitude
+	local w = normal * yawRate
+	if sinA > 1e-4 then
+		local angle = math.asin(math.min(1, sinA))
+		if up:Dot(normal) < 0 then
+			angle = math.pi - angle
+		end
+		w += axisVec / sinA * angle * C.ALIGN_RATE
+	end
+	return newV, w
+end
+
+local function stepAir(st, cf: CFrame, v: Vector3, w: Vector3, boosting: boolean, dt: number): (Vector3, Vector3)
+	local inp = st.input
+
+	if boosting then
+		v += cf.LookVector * BOOST_ACCEL * dt
+	elseif inp.throttle ~= 0 then
+		v += cf.LookVector * AIR_THROTTLE_ACCEL * inp.throttle * dt
+	end
+	if st.dodgeFloat > 0 and v.Y < 0 then
+		v = Vector3.new(v.X, 0, v.Z)
+	end
+
+	-- Roof jump: rotate back onto the wheels
+	if st.rightingTime > 0 then
+		local up = cf.UpVector
+		local axisVec = up:Cross(Vector3.yAxis)
+		local angle = math.acos(math.clamp(up.Y, -1, 1))
+		local axisDir = if axisVec.Magnitude > 1e-3 then axisVec.Unit else cf.LookVector
+		return v, axisDir * (angle / math.max(st.rightingTime, dt))
+	end
+
+	local pitch = inp.pitch
+	local yaw = inp.steer
+	local roll = inp.roll
+	if inp.airRoll then
+		roll = math.clamp(roll + inp.steer, -1, 1)
+		yaw = 0
+	end
+
+	-- Local axes: X = right (pitch), Y = up (yaw), Z = back (roll). Negative = nose down / right / roll right.
+	local wl = cf:VectorToObjectSpace(w)
+	local ax = -pitch * C.AIR_PITCH_TORQUE - C.AIR_PITCH_DAMP * (1 - math.abs(pitch)) * wl.X
+	local ay = -yaw * C.AIR_YAW_TORQUE - C.AIR_YAW_DAMP * (1 - math.abs(yaw)) * wl.Y
+	local az = -roll * C.AIR_ROLL_TORQUE - C.AIR_ROLL_DAMP * wl.Z
+	wl += Vector3.new(ax, ay, az) * dt
+
+	if st.dodgeTime and st.dodgeTime < C.DODGE_TORQUE_TIME then
+		local spin = st.dodgeSpin
+		if C.FLIP_CANCEL and spin.X ~= 0 and st.dodgeDirForward * pitch < -0.5 then
+			st.dodgeSpin = Vector3.new(0, 0, spin.Z)
+			spin = st.dodgeSpin
+			log(st.player.Name, "flip cancel")
+		end
+		wl = Vector3.new(
+			if spin.X ~= 0 then spin.X else wl.X,
+			wl.Y,
+			if spin.Z ~= 0 then spin.Z else wl.Z
+		)
+	end
+
+	if wl.Magnitude > C.MAX_ANGULAR_SPEED then
+		wl = wl.Unit * C.MAX_ANGULAR_SPEED
+	end
+	return v, cf:VectorToWorldSpace(wl)
+end
+
+local function stepCar(st, dt: number)
+	local hitbox = st.hitbox
+	if not hitbox.Parent then
+		return
+	end
+	local cf = hitbox.CFrame
+	if cf.Position.Y < C.KILL_Y or cf.Position ~= cf.Position then
+		log(st.player.Name, "fell out of the world, respawning")
+		placeCar(st)
+		return
+	end
+
+	local inp = st.input
+	if os.clock() - st.lastInputTime > C.INPUT_TIMEOUT then
+		local held = st.lastJumpCount
+		st.input = newInput()
+		inp = st.input
+		st.lastJumpCount = held
+	end
+
+	-- Timers
+	st.timeSinceJump += dt
+	st.groundIgnore = math.max(0, st.groundIgnore - dt)
+	st.dodgeFloat = math.max(0, st.dodgeFloat - dt)
+	st.rightingTime = math.max(0, st.rightingTime - dt)
+	if st.dodgeTime then
+		st.dodgeTime += dt
+	end
+
+	local v = hitbox.AssemblyLinearVelocity
+	local w = hitbox.AssemblyAngularVelocity
+
+	-- Ground check
+	local wheels, normal, dist = castWheels(cf)
+	local wasGrounded = st.grounded
+	st.grounded = st.groundIgnore <= 0 and wheels >= C.WHEELS_FOR_GROUNDED
+	if st.grounded and not wasGrounded then
+		st.jumped = false
+		st.secondJumpUsed = false
+		st.dodgeTime = nil
+		st.rightingTime = 0
+		st.airTime = 0
+		log(st.player.Name, "landed")
+	elseif not st.grounded then
+		st.airTime += dt
+	end
+
+	-- Jump press (edge) and jump hold
+	if st.pendingJump then
+		st.pendingJump = false
+		v, w = handleJumpPress(st, cf, v, w)
+	end
+	if st.jumpHolding then
+		if inp.jumpHeld and st.timeSinceJump < C.JUMP_HOLD_TIME then
+			v += cf.UpVector * JUMP_HOLD_ACCEL * dt
+		else
+			st.jumpHolding = false
+		end
+	end
+
+	local boosting = updateBoost(st, inp, dt)
+
+	if st.grounded then
+		v, w = stepGround(st, cf, v, normal, dist, boosting, dt)
+	else
+		v, w = stepAir(st, cf, v, w, boosting, dt)
+	end
+
+	if v.Magnitude > MAX_SPEED then
+		v = v.Unit * MAX_SPEED
+	end
+
+	hitbox.AssemblyLinearVelocity = v
+	hitbox.AssemblyAngularVelocity = w
+
+	-- Attributes other systems read
+	setAttr(st, "Grounded", st.grounded)
+	setAttr(st, "Boosting", boosting)
+	setAttr(st, "Supersonic", toUU(v.Magnitude) >= C.SUPERSONIC_SPEED)
+	setAttr(st, "Dodging", st.dodgeTime ~= nil and st.dodgeTime < C.DODGE_TORQUE_TIME)
+	local flame = hitbox:FindFirstChild("BoostAttachment")
+	flame = flame and flame:FindFirstChild("BoostFlame")
+	if flame and flame.Enabled ~= boosting then
+		flame.Enabled = boosting
+	end
+end
+
+RunService.PreSimulation:Connect(function(dt)
+	dt = math.min(dt, 1 / 20)
+	for _, st in cars do
+		local ok, err = pcall(stepCar, st, dt)
+		if not ok then
+			warn("[CAR] step error for", st.player.Name, err)
+		end
+	end
+end)
+
+----------------------------------------------------------------------
+-- Players
+----------------------------------------------------------------------
+Players.PlayerAdded:Connect(function(player)
+	spawnCar(player)
+	player.CharacterAdded:Connect(function()
+		if C.DISABLE_CHARACTERS then
+			return
+		end
+		rebuildRayFilter()
+	end)
+end)
+Players.PlayerRemoving:Connect(despawnCar)
+for _, player in Players:GetPlayers() do
+	task.spawn(spawnCar, player)
+end
+
+log("ready; hitbox", C.HITBOX_PRESET, HITBOX_SIZE, "gravity", workspace.Gravity)

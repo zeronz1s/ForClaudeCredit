@@ -32,7 +32,11 @@ RLShared.TAGS = {
 	CAR_HITBOX = "CarHitbox",   -- on each car's Hitbox part (PrimaryPart)
 	BALL = "Ball",              -- on the ball part
 	NOT_DRIVABLE = "NotDrivable", -- parts the car's wheel rays should ignore
+	GOAL = "Goal",              -- goal trigger parts (attribute Team = defending team)
 }
+
+-- Team names used everywhere (car Model attribute "Team", spawn/goal part attribute "Team")
+RLShared.TEAMS = { "Blue", "Orange" }
 
 -- Folder names
 RLShared.FOLDERS = {
@@ -40,17 +44,26 @@ RLShared.FOLDERS = {
 	CARS = "Cars",              -- Workspace > Cars (created at runtime by CarController)
 	CAR_SPAWNS = "CarSpawns",   -- Workspace > CarSpawns (optional, Parts marking spawn spots)
 	CAR_TEMPLATES = "CarTemplates", -- ServerStorage > CarTemplates (optional car Models)
+	CAR_EVENTS = "CarEvents",   -- ServerStorage > CarEvents (created at runtime by CarController)
+}
+
+-- Server-only BindableEvents in ServerStorage > CarEvents
+RLShared.CAR_EVENTS = {
+	ADD_BOOST = "AddBoost",     -- :Fire(carModel, amount) adds boost, clamped to 100
 }
 
 -- Remote names (all live in ReplicatedStorage > Remotes)
 RLShared.REMOTES = {
 	CAR_INPUT = "CarInput",     -- UnreliableRemoteEvent, client -> server, every frame
 	CAR_SPAWNED = "CarSpawned", -- RemoteEvent, server -> client, (carModel)
+	BALL_HIT = "BallHit",       -- RemoteEvent, owned by BallServer
+	GOAL_SCORED = "GoalScored", -- RemoteEvent, owned by BallServer
 }
 
 -- Car Model attributes other systems may read (written only by CarController)
 --   OwnerUserId  number   player who drives it
---   Boost        number   0..100
+--   Team         string   "Blue" or "Orange" (player.Team if it has one of those names, else auto-balanced)
+--   Boost        number   0..100 (pads refill it through CarEvents > AddBoost)
 --   Boosting     boolean
 --   Grounded     boolean
 --   Supersonic   boolean  speed >= 2200 uu/s

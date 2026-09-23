@@ -1,0 +1,277 @@
+--[[
+	Name:     CarInput
+	Class:    LocalScript
+	Parent:   StarterPlayer > StarterPlayerScripts > CarInput
+
+	Client side of the car. Reads keyboard, mouse and gamepad, sends the raw
+	stick/button state to the server every frame (the server decides what the
+	car does), and runs the RL-style car cam / ball cam.
+
+	Default controls (change them in ReplicatedStorage > CarConfig > KEYS):
+	  W / S ........... throttle / reverse (and pitch in the air)
+	  A / D ........... steer (and yaw in the air)
+	  Space or RMB .... jump (press again in the air to double jump or flip)
+	  Left Mouse / Ctrl boost
+	  Left Shift ...... powerslide on the ground, free air roll in the air
+	  Q / E ........... air roll left / right
+	  Y ............... toggle ball cam
+	Gamepad: RT/LT throttle, left stick steer/pitch, A jump, B boost, X powerslide,
+	LB/RB air roll, Y ball cam.
+]]
+
+----------------------------------------------------------------------
+-- CONFIG (the rest lives in ReplicatedStorage > CarConfig)
+----------------------------------------------------------------------
+local DEBUG = false
+local CAMERA_BIND_NAME = "RLCarCamera"
+local BALL_CAM_MAX_PITCH = 35   -- degrees; stops the camera flipping when the ball is overhead
+
+----------------------------------------------------------------------
+-- Services and modules
+----------------------------------------------------------------------
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+
+local RLShared = require(ReplicatedStorage:WaitForChild("RLShared"))
+local C = require(ReplicatedStorage:WaitForChild("CarConfig"))
+
+local function log(...)
+	if DEBUG then
+		print("[CARINPUT]", ...)
+	end
+end
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+local remotes = ReplicatedStorage:WaitForChild(RLShared.FOLDERS.REMOTES)
+local inputRemote = remotes:WaitForChild(RLShared.REMOTES.CAR_INPUT)
+local spawnedRemote = remotes:WaitForChild(RLShared.REMOTES.CAR_SPAWNED)
+
+local FLAG_BOOST = 1
+local FLAG_HANDBRAKE = 2
+local FLAG_AIR_ROLL = 4
+local FLAG_JUMP_HELD = 8
+
+----------------------------------------------------------------------
+-- Finding our car
+----------------------------------------------------------------------
+local carModel: Model? = nil
+local hitbox: BasePart? = nil
+
+local function setCar(model)
+	if typeof(model) ~= "Instance" or not model:IsA("Model") then
+		return
+	end
+	local hb = model:WaitForChild("Hitbox", 10)
+	if not hb then
+		warn("[CARINPUT] car has no Hitbox")
+		return
+	end
+	carModel = model
+	hitbox = hb
+	log("got car", model:GetFullName())
+end
+
+spawnedRemote.OnClientEvent:Connect(setCar)
+
+-- Fallback in case the spawn event fired before this script was listening.
+task.spawn(function()
+	local carsFolder = workspace:WaitForChild(RLShared.FOLDERS.CARS)
+	local myName = tostring(player.UserId)
+	carsFolder.ChildAdded:Connect(function(child)
+		if child.Name == myName then
+			setCar(child)
+		end
+	end)
+	local existing = carsFolder:FindFirstChild(myName)
+	if existing and not carModel then
+		setCar(existing)
+	end
+end)
+
+----------------------------------------------------------------------
+-- Reading input
+----------------------------------------------------------------------
+local function isGamepadKey(key: Enum.KeyCode): boolean
+	local n = key.Name
+	return n:sub(1, 6) == "Button" or n:sub(1, 4) == "DPad"
+end
+
+local function isDown(keys): boolean
+	for _, key in keys do
+		if isGamepadKey(key) then
+			if UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, key) then
+				return true
+			end
+		elseif UserInputService:IsKeyDown(key) then
+			return true
+		end
+	end
+	return false
+end
+
+local function matches(keys, key: Enum.KeyCode): boolean
+	for _, k in keys do
+		if k == key then
+			return true
+		end
+	end
+	return false
+end
+
+local function deadzone(x: number): number
+	if math.abs(x) < C.GAMEPAD_DEADZONE then
+		return 0
+	end
+	return math.sign(x) * (math.abs(x) - C.GAMEPAD_DEADZONE) / (1 - C.GAMEPAD_DEADZONE)
+end
+
+-- Analog gamepad state: left stick and triggers
+local function readGamepad()
+	local stick, rt, lt = Vector2.zero, 0, 0
+	if not UserInputService:GetGamepadConnected(Enum.UserInputType.Gamepad1) then
+		return stick, rt, lt
+	end
+	for _, obj in UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1) do
+		if obj.KeyCode == Enum.KeyCode.Thumbstick1 then
+			stick = Vector2.new(deadzone(obj.Position.X), deadzone(obj.Position.Y))
+		elseif obj.KeyCode == Enum.KeyCode.ButtonR2 then
+			rt = obj.Position.Z
+		elseif obj.KeyCode == Enum.KeyCode.ButtonL2 then
+			lt = obj.Position.Z
+		end
+	end
+	return stick, rt, lt
+end
+
+local jumpCount = 0
+local ballCam = C.BALL_CAM_DEFAULT
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed and input.UserInputType == Enum.UserInputType.Keyboard then
+		return -- typing in chat
+	end
+	local isJump = matches(C.KEYS.JUMP, input.KeyCode)
+		or (C.MOUSE_JUMP and input.UserInputType == Enum.UserInputType.MouseButton2)
+	if isJump then
+		jumpCount = (jumpCount + 1) % 65536
+		log("jump press", jumpCount)
+	elseif matches(C.KEYS.BALL_CAM, input.KeyCode) then
+		ballCam = not ballCam
+		log("ball cam", ballCam)
+	end
+end)
+
+local function gatherInput()
+	local typing = UserInputService:GetFocusedTextBox() ~= nil
+	local stick, rt, lt = readGamepad()
+
+	local keyThrottle, keySteer, keyRoll = 0, 0, 0
+	local jumpHeld, boost, slide = false, false, false
+	if not typing then
+		keyThrottle = (isDown(C.KEYS.THROTTLE) and 1 or 0) - (isDown(C.KEYS.REVERSE) and 1 or 0)
+		keySteer = (isDown(C.KEYS.STEER_RIGHT) and 1 or 0) - (isDown(C.KEYS.STEER_LEFT) and 1 or 0)
+		keyRoll = (isDown(C.KEYS.AIR_ROLL_RIGHT) and 1 or 0) - (isDown(C.KEYS.AIR_ROLL_LEFT) and 1 or 0)
+		jumpHeld = isDown(C.KEYS.JUMP)
+			or (C.MOUSE_JUMP and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2))
+		boost = isDown(C.KEYS.BOOST)
+			or (C.MOUSE_BOOST and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1))
+		slide = isDown(C.KEYS.POWERSLIDE)
+	end
+
+	local padThrottle = rt - lt
+	local throttle = if math.abs(padThrottle) > math.abs(keyThrottle) then padThrottle else keyThrottle
+	local steer = if math.abs(stick.X) > math.abs(keySteer) then stick.X else keySteer
+	-- Stick forward = nose down, like RL. Keyboard W/S pitch too when enabled.
+	local keyPitch = if C.KEYBOARD_PITCH_FROM_THROTTLE then keyThrottle else 0
+	local pitch = if math.abs(stick.Y) > math.abs(keyPitch) then stick.Y else keyPitch
+
+	local flags = 0
+	if boost then flags += FLAG_BOOST end
+	if slide then flags += FLAG_HANDBRAKE + FLAG_AIR_ROLL end
+	if jumpHeld then flags += FLAG_JUMP_HELD end
+
+	return throttle, steer, pitch, keyRoll, flags
+end
+
+local sendAccumulator = 0
+RunService.Heartbeat:Connect(function(dt)
+	if not (hitbox and hitbox.Parent) then
+		return
+	end
+	sendAccumulator += dt
+	local interval = 1 / C.INPUT_SEND_RATE
+	if sendAccumulator < interval then
+		return
+	end
+	sendAccumulator = math.min(sendAccumulator - interval, interval)
+	local throttle, steer, pitch, roll, flags = gatherInput()
+	inputRemote:FireServer(throttle, steer, pitch, roll, flags, jumpCount)
+end)
+
+----------------------------------------------------------------------
+-- Camera (car cam / ball cam)
+----------------------------------------------------------------------
+local camDir = Vector3.new(0, 0, -1)
+local camDistance = RLShared.uu(C.CAMERA_DISTANCE)
+local camHeight = RLShared.uu(C.CAMERA_HEIGHT)
+
+local function findBall(): BasePart?
+	for _, inst in CollectionService:GetTagged(RLShared.TAGS.BALL) do
+		if inst:IsA("BasePart") and inst:IsDescendantOf(workspace) then
+			return inst
+		end
+	end
+	return nil
+end
+
+local function flatUnit(v: Vector3): Vector3?
+	local f = Vector3.new(v.X, 0, v.Z)
+	if f.Magnitude < 1e-3 then
+		return nil
+	end
+	return f.Unit
+end
+
+RunService:BindToRenderStep(CAMERA_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, function(dt)
+	if not (hitbox and hitbox.Parent) then
+		if camera.CameraType == Enum.CameraType.Scriptable then
+			camera.CameraType = Enum.CameraType.Custom
+		end
+		return
+	end
+	camera.CameraType = Enum.CameraType.Scriptable
+	camera.FieldOfView = C.CAMERA_FOV
+
+	local target = hitbox.Position
+	local ball = if ballCam then findBall() else nil
+
+	local wanted
+	if ball then
+		wanted = flatUnit(ball.Position - target)
+	else
+		wanted = flatUnit(hitbox.CFrame.LookVector) or flatUnit(-hitbox.CFrame.UpVector)
+	end
+	if wanted then
+		local alpha = 1 - math.exp(-C.CAMERA_SHARPNESS * dt)
+		local blended = camDir:Lerp(wanted, alpha)
+		camDir = if blended.Magnitude > 1e-3 then blended.Unit else wanted
+	end
+
+	local camPos = target - camDir * camDistance + Vector3.yAxis * camHeight
+	local look
+	if ball then
+		look = CFrame.lookAt(camPos, ball.Position)
+		local x, y = look:ToOrientation()
+		local maxPitch = math.rad(BALL_CAM_MAX_PITCH)
+		look = CFrame.new(camPos) * CFrame.fromOrientation(math.clamp(x, -maxPitch, maxPitch), y, 0)
+	else
+		look = CFrame.lookAt(camPos, camPos + camDir)
+	end
+	camera.CFrame = look * CFrame.Angles(math.rad(C.CAMERA_ANGLE), 0, 0)
+end)
+
+log("ready")
