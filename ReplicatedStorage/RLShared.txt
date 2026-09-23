@@ -1,0 +1,98 @@
+--[[
+	Name:     RLShared
+	Class:    ModuleScript
+	Parent:   ReplicatedStorage > RLShared
+
+	Shared foundation for every Rocket League system (cars, ball, goals, boost pads).
+	Holds world scale, gravity, tag names, remote names and folder names so every
+	system agrees on them. Other configs (CarConfig, BallConfig, ...) require this.
+
+	Units: Rocket League measures in "uu" (unreal units, ~1 cm). Every RL number in
+	the configs is written in uu and converted to studs with RLShared.uu().
+]]
+
+local RLShared = {}
+
+----------------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------------
+RLShared.DEBUG = false
+
+-- World scale: how many studs one RL unit is. 1/25 makes the Octane hitbox
+-- about 4.7 x 1.4 x 3.4 studs, the ball 7.3 studs wide and the field 328 x 410.
+RLShared.STUDS_PER_UU = 1 / 25
+
+-- RL gravity is 650 uu/s^2. Every system sets workspace.Gravity to this at startup
+-- (setting it twice is harmless), so nothing needs anti-gravity forces.
+RLShared.GRAVITY_UU = 650
+
+-- CollectionService tags
+RLShared.TAGS = {
+	CAR = "Car",                -- on each car Model
+	CAR_HITBOX = "CarHitbox",   -- on each car's Hitbox part (PrimaryPart)
+	BALL = "Ball",              -- on the ball part
+	NOT_DRIVABLE = "NotDrivable", -- parts the car's wheel rays should ignore
+}
+
+-- Folder names
+RLShared.FOLDERS = {
+	REMOTES = "Remotes",        -- ReplicatedStorage > Remotes (created at runtime by server scripts)
+	CARS = "Cars",              -- Workspace > Cars (created at runtime by CarController)
+	CAR_SPAWNS = "CarSpawns",   -- Workspace > CarSpawns (optional, Parts marking spawn spots)
+	CAR_TEMPLATES = "CarTemplates", -- ServerStorage > CarTemplates (optional car Models)
+}
+
+-- Remote names (all live in ReplicatedStorage > Remotes)
+RLShared.REMOTES = {
+	CAR_INPUT = "CarInput",     -- UnreliableRemoteEvent, client -> server, every frame
+	CAR_SPAWNED = "CarSpawned", -- RemoteEvent, server -> client, (carModel)
+}
+
+-- Car Model attributes other systems may read (written only by CarController)
+--   OwnerUserId  number   player who drives it
+--   Boost        number   0..100
+--   Boosting     boolean
+--   Grounded     boolean
+--   Supersonic   boolean  speed >= 2200 uu/s
+--   Dodging      boolean  inside a flip's torque window
+-- Car velocity: read Hitbox.AssemblyLinearVelocity / AssemblyAngularVelocity.
+-- The server owns every car's physics, so those values are authoritative.
+
+----------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------
+
+-- Convert an RL distance/speed/acceleration (uu, uu/s, uu/s^2) to studs.
+function RLShared.uu(value: number): number
+	return value * RLShared.STUDS_PER_UU
+end
+
+-- Convert studs back to uu (handy for debug prints).
+function RLShared.toUU(studs: number): number
+	return studs / RLShared.STUDS_PER_UU
+end
+
+RLShared.GRAVITY = RLShared.uu(RLShared.GRAVITY_UU)
+
+-- Find or create a child. Server scripts use this for the Remotes folder so
+-- nothing has to be inserted by hand in Studio.
+function RLShared.getOrCreate(parent: Instance, className: string, name: string): Instance
+	local existing = parent:FindFirstChild(name)
+	if existing then
+		return existing
+	end
+	local inst = Instance.new(className)
+	inst.Name = name
+	inst.Parent = parent
+	return inst
+end
+
+local function log(...)
+	if RLShared.DEBUG then
+		print("[RLSHARED]", ...)
+	end
+end
+
+log("loaded, studs per uu =", RLShared.STUDS_PER_UU, "gravity =", RLShared.GRAVITY)
+
+return RLShared
