@@ -1,0 +1,722 @@
+--[[
+	============================================================
+	Script name : BallServer
+	Class type  : Script (server)
+	Parent      : ServerScriptService
+	============================================================
+	Rocket League ball + goals, server-authoritative.
+
+	What it does
+	  * Spawns the ball (Rocket League size, mass, bounce, drag,
+	    speed caps and its own gravity) and keeps network ownership
+	    on the server so no client can move it.
+	  * Detects car-to-ball contact every physics step and applies
+	    Rocket League's extra "hit impulse" on top of the normal
+	    Roblox collision (same formula RL / RocketSim uses).
+	  * Watches the goal trigger volumes. A goal only counts when
+	    the WHOLE ball is inside the volume, same as RL's
+	    "fully across the line" rule.
+	  * On a goal: hides the ball, updates the score, tells every
+	    client, waits, then resets the ball to centre.
+
+	Talking to other systems (server side)
+	  ServerStorage.BallEvents.BallHit     (BindableEvent)  fires (player?, carModel, hitSpeedKmh)
+	  ServerStorage.BallEvents.GoalScored  (BindableEvent)  fires (scoringTeam, scorerPlayer?, ballSpeedKmh, isOwnGoal)
+	  ServerStorage.BallEvents.ResetBall   (BindableEvent)  :Fire() it to put the ball back on centre
+	  ServerStorage.BallEvents.SetAutoReset(BindableEvent)  :Fire(false) once the match loop takes over resets
+	Client side
+	  ReplicatedStorage.Remotes.BallHit    (RemoteEvent)    server -> clients (position, hitSpeedKmh)
+	  ReplicatedStorage.Remotes.GoalScored (RemoteEvent)    server -> clients (scoringTeam, scorerName, ballSpeedKmh, goalPosition, isOwnGoal)
+	  ReplicatedStorage attributes BlueScore / OrangeScore  (read-only for clients)
+
+	All of the above are created by this script at runtime, you do
+	not need to insert them in Studio.
+
+	Needs ReplicatedStorage > RLShared (the shared ModuleScript from the
+	car controller). Scale, gravity, tag and folder names come from it.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+
+local RLShared = require(ReplicatedStorage:WaitForChild("RLShared"))
+
+--============================================================
+-- CONFIG  (every tunable number lives here)
+--============================================================
+local CONFIG = {
+	-- Debug -------------------------------------------------------
+	DEBUG = true,                   -- prints [BALL] logs to Output
+	DEBUG_SHOW_GOAL_VOLUMES = true, -- makes goal volumes see-through red/blue so you can check placement
+
+	-- World ------------------------------------------------------
+	-- Scale (studs per uu) and gravity come from RLShared, so they always
+	-- match the cars. Every RL number below is in uu (1 uu = 1 cm).
+	FLOOR_Y = 0,                    -- world Y of the pitch surface (default Baseplate top = 0)
+
+	-- Ball (real Rocket League values, in uu) ---------------------
+	BALL_RADIUS_UU = 91.25,         -- RL soccar ball radius
+	BALL_MAX_SPEED_UU = 6000,       -- RL ball speed cap, uu/s
+	BALL_MAX_SPIN = 6,              -- RL ball angular speed cap, rad/s
+	BALL_DRAG = 0.03,               -- RL linear damping per second (0.03 = loses 3% speed per second in air)
+	BALL_RESTITUTION = 0.6,         -- RL ball bounciness
+	BALL_FRICTION = 0.35,           -- RL ball surface friction
+	BALL_ELASTICITY_WEIGHT = 100,   -- high = the ball's bounce wins over the floor/wall material
+	BALL_FRICTION_WEIGHT = 1,
+
+	-- Ball mass. RL: ball 30, car 180 (ball = 1/6 of a car).
+	BALL_DENSITY = 0.05,            -- used until a car is seen (Roblox density units)
+	AUTO_MATCH_CAR_MASS = true,     -- on first car contact, set ball mass = car mass * ratio below
+	BALL_TO_CAR_MASS_RATIO = 30 / 180,
+
+	-- Ball look ---------------------------------------------------
+	BALL_COLOR = Color3.fromRGB(205, 205, 210),
+	BALL_MATERIAL = Enum.Material.SmoothPlastic,
+	-- Optional: drop a Rocket League ball mesh (from the Toolbox) into
+	-- ServerStorage and name it this. It becomes the ball's visual,
+	-- the physics stays a perfect sphere. Leave the name if you don't have one.
+	BALL_VISUAL_TEMPLATE_NAME = "BallVisual",
+
+	-- Car -> ball hit impulse (RL / RocketSim constants) -----------
+	-- RL adds this velocity to the ball on top of the normal collision.
+	HIT_Z_SCALE = 0.35,             -- squashes the vertical part of the hit direction
+	HIT_FORWARD_SCALE = 0.65,       -- how much of the car's forward direction survives in the hit direction
+	HIT_MAX_DELTA_SPEED_UU = 4600,  -- relative speed cap used for the impulse, uu/s
+	-- Impulse factor curve: {relative speed uu/s, factor}. Straight from RL.
+	HIT_FACTOR_CURVE = {
+		{ 0, 0.65 },
+		{ 500, 0.65 },
+		{ 2300, 0.55 },
+		{ 4600, 0.30 },
+	},
+	HIT_CONTACT_MARGIN = 0.25,      -- studs of slack when checking "is the car touching the ball"
+	HIT_COOLDOWN = 0.1,             -- seconds before the same car can add another extra impulse
+
+	-- Which things count as cars ----------------------------------
+	-- Car tag, hitbox tag and OwnerUserId come from RLShared / CarController.
+	CAR_HITBOX_NAME = "Hitbox",     -- fallback if no part carries the CarHitbox tag (then PrimaryPart)
+	CAR_TEAM_ATTRIBUTE = "Team",    -- "Blue" / "Orange" on the car Model (falls back to player.Team.Name)
+	CAR_OWNER_ATTRIBUTE = "OwnerUserId",
+	CHARACTERS_COUNT_AS_CARS = true,-- your R6 character can bump the ball (ignored while you have a car)
+
+	-- Goals -------------------------------------------------------
+	GOAL_TAG = RLShared.TAGS.GOAL or "Goal", -- CollectionService tag on each goal trigger Part
+	GOAL_TEAM_ATTRIBUTE = "Team",   -- the team that DEFENDS that goal: "Blue" or "Orange"
+	GOAL_FOLDER_NAME = "Goals",     -- or put parts named BlueGoal / OrangeGoal in workspace.Goals
+	GOAL_INSIDE_TOLERANCE = 0.05,   -- studs, forgiveness on the "whole ball inside" test
+	AUTO_BUILD_TEST_GOALS = true,   -- no goals found -> build two RL-sized goal volumes so you can test
+
+	-- RL soccar field, used for the test goals and ball spawn (uu)
+	FIELD_HALF_LENGTH_UU = 5120,    -- centre to goal line
+	GOAL_WIDTH_UU = 1786,
+	GOAL_HEIGHT_UU = 642.775,
+	GOAL_DEPTH_UU = 880,
+	BLUE_GOAL_SIDE = -1,            -- Blue defends the -Z end, Orange the +Z end
+
+	-- Flow --------------------------------------------------------
+	GOAL_RESET_DELAY = 3,           -- seconds between goal and ball back on centre
+	AUTO_RESET_AFTER_GOAL = true,   -- the match loop can turn this off via SetAutoReset
+	KILL_Y = -100,                  -- ball below this (studs) = fell out of the map, reset it
+	RESET_HOLD_TIME = 0.1,          -- seconds the ball is anchored while teleporting
+}
+
+--============================================================
+-- DEBUG
+--============================================================
+local function log(...)
+	if CONFIG.DEBUG then
+		print("[BALL]", ...)
+	end
+end
+
+local function warnLog(...)
+	warn("[BALL]", ...)
+end
+
+--============================================================
+-- Derived values (studs)
+--============================================================
+local S = RLShared.STUDS_PER_UU
+local BALL_RADIUS = CONFIG.BALL_RADIUS_UU * S
+local BALL_DIAMETER = BALL_RADIUS * 2
+local BALL_MAX_SPEED = CONFIG.BALL_MAX_SPEED_UU * S
+local BALL_SPAWN = Vector3.new(0, CONFIG.FLOOR_Y + BALL_RADIUS, 0)
+local UU_PER_SEC_TO_KMH = 0.036 -- 1 uu/s = 0.036 km/h
+
+local function studsPerSecToKmh(speedStuds: number): number
+	return math.floor(speedStuds / S * UU_PER_SEC_TO_KMH + 0.5)
+end
+
+--============================================================
+-- Events / remotes (created here so Studio setup stays small)
+--============================================================
+local getOrCreate = RLShared.getOrCreate
+
+local REMOTE_BALL_HIT = RLShared.REMOTES.BALL_HIT or "BallHit"
+local REMOTE_GOAL_SCORED = RLShared.REMOTES.GOAL_SCORED or "GoalScored"
+local TAG_CAR = RLShared.TAGS.CAR
+local TAG_CAR_HITBOX = RLShared.TAGS.CAR_HITBOX
+local TAG_BALL = RLShared.TAGS.BALL
+local TAG_NOT_DRIVABLE = RLShared.TAGS.NOT_DRIVABLE
+
+-- RL gravity for the whole world (every system sets the same value)
+workspace.Gravity = RLShared.GRAVITY
+
+local remotesFolder = getOrCreate(ReplicatedStorage, "Folder", RLShared.FOLDERS.REMOTES)
+local remoteBallHit = getOrCreate(remotesFolder, "RemoteEvent", REMOTE_BALL_HIT) :: RemoteEvent
+local remoteGoalScored = getOrCreate(remotesFolder, "RemoteEvent", REMOTE_GOAL_SCORED) :: RemoteEvent
+
+local eventsFolder = getOrCreate(ServerStorage, "Folder", "BallEvents")
+local evBallHit = getOrCreate(eventsFolder, "BindableEvent", "BallHit") :: BindableEvent
+local evGoalScored = getOrCreate(eventsFolder, "BindableEvent", "GoalScored") :: BindableEvent
+local evResetBall = getOrCreate(eventsFolder, "BindableEvent", "ResetBall") :: BindableEvent
+local evSetAutoReset = getOrCreate(eventsFolder, "BindableEvent", "SetAutoReset") :: BindableEvent
+
+if ReplicatedStorage:GetAttribute("BlueScore") == nil then
+	ReplicatedStorage:SetAttribute("BlueScore", 0)
+end
+if ReplicatedStorage:GetAttribute("OrangeScore") == nil then
+	ReplicatedStorage:SetAttribute("OrangeScore", 0)
+end
+
+--============================================================
+-- Ball creation
+--============================================================
+local ball: Part
+local massMatched = false
+
+local function applyBallPhysics(density: number)
+	ball.CustomPhysicalProperties = PhysicalProperties.new(
+		math.clamp(density, 0.01, 100),
+		CONFIG.BALL_FRICTION,
+		CONFIG.BALL_RESTITUTION,
+		CONFIG.BALL_FRICTION_WEIGHT,
+		CONFIG.BALL_ELASTICITY_WEIGHT
+	)
+end
+
+local function attachVisual()
+	local template = ServerStorage:FindFirstChild(CONFIG.BALL_VISUAL_TEMPLATE_NAME)
+	if not (template and template:IsA("BasePart")) then
+		log("no", CONFIG.BALL_VISUAL_TEMPLATE_NAME, "in ServerStorage, using the plain sphere look")
+		return
+	end
+	local visual = template:Clone()
+	visual.Name = "Visual"
+	visual.Anchored = false
+	visual.CanCollide = false
+	visual.CanTouch = false
+	visual.CanQuery = false
+	visual.Massless = true
+	visual.Size = visual.Size * (BALL_DIAMETER / math.max(visual.Size.X, visual.Size.Y, visual.Size.Z))
+	visual.CFrame = ball.CFrame
+	visual.Parent = ball
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = ball
+	weld.Part1 = visual
+	weld.Parent = visual
+
+	ball.Transparency = 1
+	log("using", CONFIG.BALL_VISUAL_TEMPLATE_NAME, "as the ball visual")
+end
+
+local function createBall()
+	local old = workspace:FindFirstChild("Ball")
+	if old then
+		old:Destroy()
+	end
+
+	ball = Instance.new("Part")
+	ball.Name = "Ball"
+	ball.Shape = Enum.PartType.Ball
+	ball.Size = Vector3.one * BALL_DIAMETER
+	ball.Color = CONFIG.BALL_COLOR
+	ball.Material = CONFIG.BALL_MATERIAL
+	ball.TopSurface = Enum.SurfaceType.Smooth
+	ball.BottomSurface = Enum.SurfaceType.Smooth
+	ball.CFrame = CFrame.new(BALL_SPAWN)
+	ball.Anchored = false
+	ball.CanCollide = true
+	ball.CanTouch = true
+	ball.CanQuery = true
+	applyBallPhysics(CONFIG.BALL_DENSITY)
+	CollectionService:AddTag(ball, TAG_BALL)
+	CollectionService:AddTag(ball, TAG_NOT_DRIVABLE) -- car wheel rays ignore the ball
+
+	ball.Parent = workspace
+	ball:SetNetworkOwner(nil) -- server owns the ball, clients can't move it
+
+	attachVisual()
+	log("ball created, diameter", string.format("%.2f", BALL_DIAMETER), "studs, mass", string.format("%.2f", ball.AssemblyMass))
+end
+
+--============================================================
+-- Goals
+--============================================================
+type Goal = { part: BasePart, team: string }
+local goals: { Goal } = {}
+
+local function otherTeam(team: string): string
+	return if team == "Blue" then "Orange" else "Blue"
+end
+
+local function buildTestGoals()
+	local folder = getOrCreate(workspace, "Folder", CONFIG.GOAL_FOLDER_NAME)
+	local width = CONFIG.GOAL_WIDTH_UU * S
+	local height = CONFIG.GOAL_HEIGHT_UU * S
+	local depth = CONFIG.GOAL_DEPTH_UU * S
+	local lineZ = CONFIG.FIELD_HALF_LENGTH_UU * S
+
+	for _, team in { "Blue", "Orange" } do
+		local side = if team == "Blue" then CONFIG.BLUE_GOAL_SIDE else -CONFIG.BLUE_GOAL_SIDE
+		local p = Instance.new("Part")
+		p.Name = team .. "Goal"
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanTouch = false
+		p.CanQuery = false
+		p.Size = Vector3.new(width, height, depth)
+		-- front face sits exactly on the goal line, the box goes back into the net
+		p.CFrame = CFrame.new(0, CONFIG.FLOOR_Y + height / 2, side * (lineZ + depth / 2))
+		p:SetAttribute(CONFIG.GOAL_TEAM_ATTRIBUTE, team)
+		p.Parent = folder
+	end
+	log("no goals found, built RL-sized test goals at Z = +/-", string.format("%.1f", lineZ))
+end
+
+local function collectGoals()
+	table.clear(goals)
+	local seen = {}
+
+	local function add(part: Instance, fallbackTeam: string?)
+		if not part:IsA("BasePart") or seen[part] then
+			return
+		end
+		local team = part:GetAttribute(CONFIG.GOAL_TEAM_ATTRIBUTE) or fallbackTeam
+		if team ~= "Blue" and team ~= "Orange" then
+			warnLog("goal part", part:GetFullName(), "has no Team attribute (Blue/Orange), skipping it")
+			return
+		end
+		seen[part] = true
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = false
+		if CONFIG.DEBUG_SHOW_GOAL_VOLUMES then
+			part.Transparency = 0.8
+			part.Material = Enum.Material.ForceField
+			part.Color = if team == "Blue" then Color3.fromRGB(0, 120, 255) else Color3.fromRGB(255, 120, 0)
+		else
+			part.Transparency = 1
+		end
+		table.insert(goals, { part = part, team = team })
+	end
+
+	for _, part in CollectionService:GetTagged(CONFIG.GOAL_TAG) do
+		add(part, nil)
+	end
+	local folder = workspace:FindFirstChild(CONFIG.GOAL_FOLDER_NAME)
+	if folder then
+		for _, child in folder:GetChildren() do
+			local fallback = if child.Name == "BlueGoal" then "Blue" elseif child.Name == "OrangeGoal" then "Orange" else nil
+			add(child, fallback)
+		end
+	end
+
+	if #goals == 0 and CONFIG.AUTO_BUILD_TEST_GOALS then
+		buildTestGoals()
+		collectGoals()
+		return
+	end
+	log("tracking", #goals, "goal volume(s)")
+end
+
+-- Whole-sphere-inside-box test. The ball only counts once every bit of it
+-- is inside the volume, which is RL's "fully over the line" rule.
+local function ballFullyInside(part: BasePart, ballPos: Vector3): boolean
+	local localPos = part.CFrame:PointToObjectSpace(ballPos)
+	local half = part.Size / 2
+	local r = BALL_RADIUS - CONFIG.GOAL_INSIDE_TOLERANCE
+	return math.abs(localPos.X) <= half.X - r
+		and math.abs(localPos.Y) <= half.Y - r
+		and math.abs(localPos.Z) <= half.Z - r
+end
+
+--============================================================
+-- Cars
+--============================================================
+type CarInfo = {
+	model: Model,
+	hitboxCFrame: CFrame,
+	hitboxSize: Vector3,
+	velocity: Vector3,
+	mass: number,
+	player: Player?,
+	team: string?,
+}
+
+local function getHitbox(model: Model): BasePart?
+	for _, d in model:GetDescendants() do
+		if d:IsA("BasePart") and CollectionService:HasTag(d, TAG_CAR_HITBOX) then
+			return d
+		end
+	end
+	local hb = model:FindFirstChild(CONFIG.CAR_HITBOX_NAME, true)
+	if hb and hb:IsA("BasePart") then
+		return hb
+	end
+	return model.PrimaryPart
+end
+
+local function getOwner(model: Model): Player?
+	local fromChar = Players:GetPlayerFromCharacter(model)
+	if fromChar then
+		return fromChar
+	end
+	local userId = model:GetAttribute(CONFIG.CAR_OWNER_ATTRIBUTE)
+	if typeof(userId) == "number" then
+		return Players:GetPlayerByUserId(userId)
+	end
+	return nil
+end
+
+local function getTeam(model: Model, player: Player?): string?
+	local team = model:GetAttribute(CONFIG.CAR_TEAM_ATTRIBUTE)
+	if team == "Blue" or team == "Orange" then
+		return team
+	end
+	if player and player.Team and (player.Team.Name == "Blue" or player.Team.Name == "Orange") then
+		return player.Team.Name
+	end
+	return nil
+end
+
+local function gatherCars(): { CarInfo }
+	local list = {}
+
+	local playersWithCars: { [Player]: boolean } = {}
+	for _, inst in CollectionService:GetTagged(TAG_CAR) do
+		if inst:IsA("Model") and inst:IsDescendantOf(workspace) then
+			local hb = getHitbox(inst)
+			if hb then
+				local player = getOwner(inst)
+				if player then
+					playersWithCars[player] = true
+				end
+				table.insert(list, {
+					model = inst,
+					hitboxCFrame = hb.CFrame,
+					hitboxSize = hb.Size,
+					velocity = hb.AssemblyLinearVelocity,
+					mass = hb.AssemblyMass,
+					player = player,
+					team = getTeam(inst, player),
+				})
+			end
+		end
+	end
+
+	if CONFIG.CHARACTERS_COUNT_AS_CARS then
+		for _, player in Players:GetPlayers() do
+			local char = player.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			local driving = playersWithCars[player] or (hum ~= nil and hum.Sit)
+			if char and root and root:IsA("BasePart") and not driving and not CollectionService:HasTag(char, TAG_CAR) then
+				local cf, size = char:GetBoundingBox()
+				table.insert(list, {
+					model = char,
+					hitboxCFrame = cf,
+					hitboxSize = size,
+					velocity = root.AssemblyLinearVelocity,
+					mass = root.AssemblyMass,
+					player = player,
+					team = getTeam(char, player),
+				})
+			end
+		end
+	end
+
+	return list
+end
+
+-- Closest distance from the ball centre to the car's hitbox box.
+local function distanceToHitbox(car: CarInfo, ballPos: Vector3): number
+	local localPos = car.hitboxCFrame:PointToObjectSpace(ballPos)
+	local half = car.hitboxSize / 2
+	local clamped = Vector3.new(
+		math.clamp(localPos.X, -half.X, half.X),
+		math.clamp(localPos.Y, -half.Y, half.Y),
+		math.clamp(localPos.Z, -half.Z, half.Z)
+	)
+	return (localPos - clamped).Magnitude
+end
+
+-- Piecewise-linear lookup on the RL factor curve.
+local function hitFactor(relSpeedUU: number): number
+	local curve = CONFIG.HIT_FACTOR_CURVE
+	if relSpeedUU <= curve[1][1] then
+		return curve[1][2]
+	end
+	for i = 2, #curve do
+		local a, b = curve[i - 1], curve[i]
+		if relSpeedUU <= b[1] then
+			local t = (relSpeedUU - a[1]) / (b[1] - a[1])
+			return a[2] + (b[2] - a[2]) * t
+		end
+	end
+	return curve[#curve][2]
+end
+
+-- RL's extra hit impulse (same maths as RocketSim's Car-Ball collision).
+-- Returns the velocity to ADD to the ball, in studs/s.
+local function computeHitImpulse(car: CarInfo, ballPos: Vector3, ballVel: Vector3): Vector3
+	local relSpeedUU = math.min((ballVel - car.velocity).Magnitude / S, CONFIG.HIT_MAX_DELTA_SPEED_UU)
+	if relSpeedUU <= 0 then
+		return Vector3.zero
+	end
+
+	local carPos = car.hitboxCFrame.Position
+	-- forward = the hitbox's longest horizontal axis (works for X- or Z-forward cars).
+	-- Its sign doesn't matter: it's used twice in the formula below.
+	local forward = if car.hitboxSize.X > car.hitboxSize.Z
+		then car.hitboxCFrame.RightVector
+		else car.hitboxCFrame.LookVector
+	local rel = ballPos - carPos
+	-- Roblox Y is up (RL Z is up), so the Z-scale goes on Y
+	local hitDir = Vector3.new(rel.X, rel.Y * CONFIG.HIT_Z_SCALE, rel.Z)
+	if hitDir.Magnitude < 1e-4 then
+		return Vector3.zero
+	end
+	hitDir = hitDir.Unit
+	hitDir = hitDir - forward * hitDir:Dot(forward) * (1 - CONFIG.HIT_FORWARD_SCALE)
+	if hitDir.Magnitude < 1e-4 then
+		return Vector3.zero
+	end
+	hitDir = hitDir.Unit
+
+	return hitDir * (relSpeedUU * hitFactor(relSpeedUU) * S)
+end
+
+--============================================================
+-- State
+--============================================================
+local state = "Live" -- "Live" | "Scored" | "Resetting"
+local autoReset = CONFIG.AUTO_RESET_AFTER_GOAL
+local touching: { [Model]: boolean } = {}
+local lastHitTime: { [Model]: number } = {}
+local lastCarVel: { [Model]: Vector3 } = {}
+local lastBallVel = Vector3.zero
+local lastTouchByTeam: { [string]: Player? } = {}
+local lastTouchTeam: string? = nil
+
+local function setBallVisible(visible: boolean)
+	ball.CanCollide = visible
+	local visual = ball:FindFirstChild("Visual")
+	if visual and visual:IsA("BasePart") then
+		visual.Transparency = if visible then 0 else 1
+		ball.Transparency = 1
+	else
+		ball.Transparency = if visible then 0 else 1
+	end
+end
+
+local function resetBall()
+	state = "Resetting"
+	ball.Anchored = true
+	ball.AssemblyLinearVelocity = Vector3.zero
+	ball.AssemblyAngularVelocity = Vector3.zero
+	ball.CFrame = CFrame.new(BALL_SPAWN)
+	setBallVisible(true)
+	table.clear(touching)
+	table.clear(lastHitTime)
+	table.clear(lastTouchByTeam)
+	lastTouchTeam = nil
+	lastBallVel = Vector3.zero
+	ball:SetAttribute("LastTouchUserId", 0)
+	ball:SetAttribute("LastTouchTeam", "")
+
+	task.wait(CONFIG.RESET_HOLD_TIME)
+	if not ball.Parent then
+		return
+	end
+	ball.Anchored = false
+	ball:SetNetworkOwner(nil)
+	state = "Live"
+	log("ball reset to centre")
+end
+
+local function onGoal(goal: Goal, ballPos: Vector3)
+	state = "Scored"
+	local scoringTeam = otherTeam(goal.team)
+	local scorer = lastTouchByTeam[scoringTeam]
+	local isOwnGoal = lastTouchTeam == goal.team
+	local speedKmh = studsPerSecToKmh(lastBallVel.Magnitude)
+
+	local key = scoringTeam .. "Score"
+	ReplicatedStorage:SetAttribute(key, (ReplicatedStorage:GetAttribute(key) or 0) + 1)
+
+	log(
+		"GOAL for", scoringTeam,
+		"| scorer:", scorer and scorer.Name or "none",
+		"| own goal:", isOwnGoal,
+		"| speed:", speedKmh, "km/h",
+		"| score Blue", ReplicatedStorage:GetAttribute("BlueScore"),
+		"- Orange", ReplicatedStorage:GetAttribute("OrangeScore")
+	)
+
+	-- freeze + hide the ball where it went in
+	ball.Anchored = true
+	ball.AssemblyLinearVelocity = Vector3.zero
+	ball.AssemblyAngularVelocity = Vector3.zero
+	setBallVisible(false)
+
+	evGoalScored:Fire(scoringTeam, scorer, speedKmh, isOwnGoal)
+	remoteGoalScored:FireAllClients(scoringTeam, scorer and scorer.DisplayName or "", speedKmh, ballPos, isOwnGoal)
+
+	if autoReset then
+		task.delay(CONFIG.GOAL_RESET_DELAY, function()
+			if state == "Scored" then
+				resetBall()
+			end
+		end)
+	end
+end
+
+local function registerHit(car: CarInfo, ballPos: Vector3, impulse: Vector3, relSpeed: number)
+	local now = os.clock()
+	lastHitTime[car.model] = now
+
+	if car.team then
+		lastTouchTeam = car.team
+		lastTouchByTeam[car.team] = car.player
+	end
+	ball:SetAttribute("LastTouchUserId", car.player and car.player.UserId or 0)
+	ball:SetAttribute("LastTouchTeam", car.team or "")
+	ball:SetAttribute("LastTouchTime", workspace:GetServerTimeNow())
+
+	local hitKmh = studsPerSecToKmh(relSpeed)
+	evBallHit:Fire(car.player, car.model, hitKmh)
+	remoteBallHit:FireAllClients(ballPos, hitKmh)
+
+	log(
+		"hit by", car.player and car.player.Name or car.model.Name,
+		"| team", car.team or "?",
+		"| rel speed", hitKmh, "km/h",
+		"| extra impulse", string.format("%.1f", impulse.Magnitude), "studs/s"
+	)
+end
+
+local function matchMassToCar(car: CarInfo)
+	if massMatched or not CONFIG.AUTO_MATCH_CAR_MASS or car.mass <= 0 then
+		return
+	end
+	if Players:GetPlayerFromCharacter(car.model) then
+		return -- characters aren't cars, don't size the ball off them
+	end
+	massMatched = true
+	local volume = (4 / 3) * math.pi * BALL_RADIUS ^ 3
+	local wanted = car.mass * CONFIG.BALL_TO_CAR_MASS_RATIO
+	applyBallPhysics(wanted / volume)
+	log("matched ball mass to car:", string.format("%.2f", ball.AssemblyMass), "(car", string.format("%.2f", car.mass) .. ")")
+end
+
+--============================================================
+-- Main physics step
+--============================================================
+local function step(dt: number)
+	if not ball or not ball.Parent then
+		createBall()
+		return
+	end
+
+	if state ~= "Live" then
+		return
+	end
+
+	local pos = ball.Position
+	local vel = ball.AssemblyLinearVelocity
+
+	-- fell out of the world / NaN guard
+	if pos.Y < CONFIG.KILL_Y or pos.Y ~= pos.Y then
+		warnLog("ball left the map, resetting")
+		task.spawn(resetBall)
+		return
+	end
+
+	-- car contacts + RL extra hit impulse
+	local now = os.clock()
+	local cars = gatherCars()
+	local stillHere: { [Model]: boolean } = {}
+	for _, car in cars do
+		stillHere[car.model] = true
+		local inContact = distanceToHitbox(car, pos) <= BALL_RADIUS + CONFIG.HIT_CONTACT_MARGIN
+		if inContact and not touching[car.model] and now - (lastHitTime[car.model] or 0) >= CONFIG.HIT_COOLDOWN then
+			matchMassToCar(car)
+			-- use last step's velocities: they're from BEFORE Roblox resolved the collision
+			local preCar = table.clone(car)
+			preCar.velocity = lastCarVel[car.model] or car.velocity
+			local preBallVel = lastBallVel
+			local impulse = computeHitImpulse(preCar, pos, preBallVel)
+			vel += impulse
+			registerHit(car, pos, impulse, (preBallVel - preCar.velocity).Magnitude)
+		end
+		touching[car.model] = inContact
+		lastCarVel[car.model] = car.velocity
+	end
+	for model in touching do
+		if not stillHere[model] then
+			touching[model] = nil
+			lastCarVel[model] = nil
+			lastHitTime[model] = nil
+		end
+	end
+
+	-- RL air drag + speed caps
+	vel *= (1 - CONFIG.BALL_DRAG) ^ dt
+	if vel.Magnitude > BALL_MAX_SPEED then
+		vel = vel.Unit * BALL_MAX_SPEED
+	end
+	ball.AssemblyLinearVelocity = vel
+
+	local spin = ball.AssemblyAngularVelocity
+	if spin.Magnitude > CONFIG.BALL_MAX_SPIN then
+		ball.AssemblyAngularVelocity = spin.Unit * CONFIG.BALL_MAX_SPIN
+	end
+
+	lastBallVel = vel
+
+	-- goals
+	for _, goal in goals do
+		if ballFullyInside(goal.part, pos) then
+			onGoal(goal, pos)
+			break
+		end
+	end
+end
+
+--============================================================
+-- Boot
+--============================================================
+createBall()
+collectGoals()
+
+CollectionService:GetInstanceAddedSignal(CONFIG.GOAL_TAG):Connect(collectGoals)
+CollectionService:GetInstanceRemovedSignal(CONFIG.GOAL_TAG):Connect(collectGoals)
+
+evResetBall.Event:Connect(function()
+	log("reset requested by another script")
+	task.spawn(resetBall)
+end)
+
+evSetAutoReset.Event:Connect(function(enabled: boolean)
+	autoReset = enabled == true
+	log("auto reset after goal:", autoReset)
+end)
+
+RunService.PostSimulation:Connect(step)
+
+log("BallServer ready | radius", string.format("%.2f", BALL_RADIUS), "studs | gravity", string.format("%.1f", workspace.Gravity), "| max speed", string.format("%.1f", BALL_MAX_SPEED))
