@@ -1,0 +1,475 @@
+--[[
+	============================================================
+	Script name : BoostPadServer
+	Class type  : Script (server)
+	Parent      : ServerScriptService
+	============================================================
+	Rocket League boost pads, server-authoritative.
+
+	What it does
+	  * Builds RL's 34 soccar boost pads at their real positions:
+	    28 small pads (+12 boost, back after 4 s) and 6 big pads
+	    (+100 boost, back after 10 s), in Workspace > BoostPads.
+	  * Checks every car against every active pad each physics step
+	    using RL's own pickup shape: a cylinder around the pad
+	    (radius 144 small / 208 big, height 95) tested against the
+	    car's position. Same as RocketSim.
+	  * A car with a full tank drives over pads without taking them.
+	  * Gives the boost, turns the pad off, and turns it back on when
+	    its timer runs out. Clients never decide any of this.
+
+	Talking to other systems
+	  Reads   car Model attributes Boost (0..100), OwnerUserId,
+	          Demolished (skips demolished cars when that exists).
+	  Boost   fires ServerStorage > CarEvents > AddBoost :Fire(car, amount)
+	          if CarController made it, otherwise sets the car's
+	          Boost attribute directly (CarController reads it each step).
+	  Server  ServerStorage.BoostPadEvents.PadPickedUp (BindableEvent) fires (player?, carModel, isBig, amount)
+	          ServerStorage.BoostPadEvents.ResetPads   (BindableEvent) :Fire() turns every pad back on (kickoff)
+	  Client  ReplicatedStorage.Remotes.BoostPickup    (RemoteEvent)   server -> clients (padModel, carModel, isBig)
+	  Pad Model attributes (read-only for clients):
+	          PadType "Big"/"Small", Active bool, RespawnAt (server time), Amount, RespawnTime
+
+	All of the above are created by this script at runtime.
+	Pad positions and pickup numbers: RocketSim RLConst.h and the
+	RLBot wiki "Useful Game Values". Pad LOOK sizes are eyeballed.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+
+local RLShared = require(ReplicatedStorage:WaitForChild("RLShared"))
+
+--============================================================
+-- CONFIG  (every tunable number lives here)
+--============================================================
+local CONFIG = {
+	-- Debug -------------------------------------------------------
+	DEBUG = true,                    -- prints [BOOSTPAD] logs to Output
+	DEBUG_SHOW_PICKUP_AREA = false,  -- draws each pad's pickup cylinder see-through
+
+	-- Placement ---------------------------------------------------
+	FLOOR_Y = 0,                     -- world Y of the pitch (must match ArenaBuilder / BallServer)
+	AUTO_BUILD_PADS = true,          -- builds RL's pads unless Workspace > BoostPads already holds your own
+
+	-- Pickup rules (real RL / RocketSim values) -------------------
+	BOOST_MAX = 100,
+	SMALL_AMOUNT = 12,
+	BIG_AMOUNT = 100,
+	SMALL_RESPAWN_TIME = 4,          -- seconds
+	BIG_RESPAWN_TIME = 10,           -- seconds
+	SMALL_PICKUP_RADIUS_UU = 144,    -- horizontal distance car -> pad centre
+	BIG_PICKUP_RADIUS_UU = 208,
+	PICKUP_HEIGHT_UU = 95,           -- max vertical distance car -> pad centre
+	PICKUP_WHEN_FULL = false,        -- RL: a car on 100 boost leaves the pad for someone else
+
+	-- Pad positions (real RL soccar, uu: {x, y, z}) ---------------
+	-- RL x -> Roblox X, RL y -> Roblox Z, RL z -> height. Blue goal is -y.
+	SMALL_PADS_UU = {
+		{ 0, -4240, 70 }, { -1792, -4184, 70 }, { 1792, -4184, 70 },
+		{ -940, -3308, 70 }, { 940, -3308, 70 }, { 0, -2816, 70 },
+		{ -3584, -2484, 70 }, { 3584, -2484, 70 }, { -1788, -2300, 70 },
+		{ 1788, -2300, 70 }, { -2048, -1036, 70 }, { 0, -1024, 70 },
+		{ 2048, -1036, 70 }, { -1024, 0, 70 }, { 1024, 0, 70 },
+		{ -2048, 1036, 70 }, { 0, 1024, 70 }, { 2048, 1036, 70 },
+		{ -1788, 2300, 70 }, { 1788, 2300, 70 }, { -3584, 2484, 70 },
+		{ 3584, 2484, 70 }, { 0, 2816, 70 }, { -940, 3308, 70 },
+		{ 940, 3308, 70 }, { -1792, 4184, 70 }, { 1792, 4184, 70 },
+		{ 0, 4240, 70 },
+	},
+	BIG_PADS_UU = {
+		{ -3584, 0, 73 }, { 3584, 0, 73 },
+		{ -3072, 4096, 73 }, { 3072, 4096, 73 },
+		{ -3072, -4096, 73 }, { 3072, -4096, 73 },
+	},
+
+	-- Look (eyeballed from RL, uu) --------------------------------
+	SMALL_BASE_RADIUS_UU = 72,
+	SMALL_GLOW_RADIUS_UU = 52,
+	BIG_BASE_RADIUS_UU = 160,
+	BIG_GLOW_RADIUS_UU = 130,
+	BIG_ORB_RADIUS_UU = 70,
+	BIG_ORB_HEIGHT_UU = 130,         -- orb centre above the pitch
+	BASE_THICKNESS = 0.12,           -- studs
+	BASE_COLOR = Color3.fromRGB(35, 35, 40),
+	GLOW_COLOR = Color3.fromRGB(255, 190, 40),
+	ORB_COLOR = Color3.fromRGB(255, 150, 20),
+	GLOW_OFF_TRANSPARENCY = 0.85,    -- big pad ring when the orb is gone
+	ORB_LIGHT_RANGE = 14,            -- studs
+	ORB_LIGHT_BRIGHTNESS = 2,
+
+	-- Names -------------------------------------------------------
+	FOLDER_NAME = "BoostPads",
+	PAD_TAG = "BoostPad",
+	REMOTE_PICKUP = RLShared.REMOTES.BOOST_PICKUP or "BoostPickup",
+	CAR_EVENTS_FOLDER = "CarEvents", -- ServerStorage > CarEvents > AddBoost (made by CarController, optional)
+	ADD_BOOST_EVENT = "AddBoost",
+	CAR_HITBOX_NAME = "Hitbox",      -- fallback if no part carries the CarHitbox tag
+}
+
+--============================================================
+-- DEBUG
+--============================================================
+local function log(...)
+	if CONFIG.DEBUG then
+		print("[BOOSTPAD]", ...)
+	end
+end
+
+--============================================================
+-- Derived values (studs)
+--============================================================
+local S = RLShared.STUDS_PER_UU
+local TAG_CAR = RLShared.TAGS.CAR
+local TAG_CAR_HITBOX = RLShared.TAGS.CAR_HITBOX
+local TAG_NOT_DRIVABLE = RLShared.TAGS.NOT_DRIVABLE
+local PICKUP_HEIGHT = CONFIG.PICKUP_HEIGHT_UU * S
+
+--============================================================
+-- Events / remotes
+--============================================================
+local getOrCreate = RLShared.getOrCreate
+local remotes = getOrCreate(ReplicatedStorage, "Folder", RLShared.FOLDERS.REMOTES)
+local remotePickup = getOrCreate(remotes, "RemoteEvent", CONFIG.REMOTE_PICKUP) :: RemoteEvent
+
+local eventsFolder = getOrCreate(ServerStorage, "Folder", "BoostPadEvents")
+local evPickedUp = getOrCreate(eventsFolder, "BindableEvent", "PadPickedUp") :: BindableEvent
+local evResetPads = getOrCreate(eventsFolder, "BindableEvent", "ResetPads") :: BindableEvent
+
+--============================================================
+-- Pads
+--============================================================
+type Pad = {
+	model: Model,
+	isBig: boolean,
+	pos: Vector3,          -- pickup cylinder centre (world)
+	radiusSq: number,
+	amount: number,
+	respawnTime: number,
+	active: boolean,
+	respawnAt: number,
+	glow: BasePart?,
+	orb: BasePart?,
+}
+local pads: { Pad } = {}
+
+-- flat cylinder lying on the pitch (Roblox cylinders point along X)
+local function disc(parent: Instance, name: string, centre: Vector3, radius: number, thickness: number, color: Color3, material: Enum.Material): Part
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Shape = Enum.PartType.Cylinder
+	p.Size = Vector3.new(thickness, radius * 2, radius * 2)
+	p.CFrame = CFrame.new(centre) * CFrame.Angles(0, 0, math.pi / 2)
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.CastShadow = false
+	p.Color = color
+	p.Material = material
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Parent = parent
+	return p
+end
+
+local function buildPad(parent: Instance, name: string, loc: { number }, isBig: boolean): Model
+	local model = Instance.new("Model")
+	model.Name = name
+	local ground = Vector3.new(loc[1] * S, CONFIG.FLOOR_Y, loc[2] * S)
+	local t = CONFIG.BASE_THICKNESS
+
+	local baseR = (if isBig then CONFIG.BIG_BASE_RADIUS_UU else CONFIG.SMALL_BASE_RADIUS_UU) * S
+	local glowR = (if isBig then CONFIG.BIG_GLOW_RADIUS_UU else CONFIG.SMALL_GLOW_RADIUS_UU) * S
+	local base = disc(model, "Base", ground + Vector3.new(0, t / 2 + 0.02, 0), baseR, t, CONFIG.BASE_COLOR, Enum.Material.SmoothPlastic)
+	disc(model, "Glow", ground + Vector3.new(0, t + 0.04, 0), glowR, 0.05, CONFIG.GLOW_COLOR, Enum.Material.Neon)
+	model.PrimaryPart = base
+
+	if isBig then
+		local orbR = CONFIG.BIG_ORB_RADIUS_UU * S
+		local orb = Instance.new("Part")
+		orb.Name = "Orb"
+		orb.Shape = Enum.PartType.Ball
+		orb.Size = Vector3.one * orbR * 2
+		orb.CFrame = CFrame.new(ground + Vector3.new(0, CONFIG.BIG_ORB_HEIGHT_UU * S, 0))
+		orb.Anchored = true
+		orb.CanCollide = false
+		orb.CanTouch = false
+		orb.CanQuery = false
+		orb.CastShadow = false
+		orb.Color = CONFIG.ORB_COLOR
+		orb.Material = Enum.Material.Neon
+		orb.Parent = model
+
+		local light = Instance.new("PointLight")
+		light.Color = CONFIG.ORB_COLOR
+		light.Range = CONFIG.ORB_LIGHT_RANGE
+		light.Brightness = CONFIG.ORB_LIGHT_BRIGHTNESS
+		light.Parent = orb
+	end
+
+	if CONFIG.DEBUG_SHOW_PICKUP_AREA then
+		local r = (if isBig then CONFIG.BIG_PICKUP_RADIUS_UU else CONFIG.SMALL_PICKUP_RADIUS_UU) * S
+		local zone = disc(model, "PickupArea", ground + Vector3.new(0, loc[3] * S, 0), r, PICKUP_HEIGHT * 2, Color3.fromRGB(0, 255, 120), Enum.Material.ForceField)
+		zone.Transparency = 0.7
+	end
+
+	model:SetAttribute("PadType", if isBig then "Big" else "Small")
+	model:SetAttribute("PadHeightUU", loc[3])
+	model.Parent = parent
+	return model
+end
+
+local function buildAllPads(parent: Instance)
+	for i, loc in CONFIG.SMALL_PADS_UU do
+		buildPad(parent, "SmallPad" .. i, loc, false)
+	end
+	for i, loc in CONFIG.BIG_PADS_UU do
+		buildPad(parent, "BigPad" .. i, loc, true)
+	end
+	log("built", #CONFIG.SMALL_PADS_UU, "small and", #CONFIG.BIG_PADS_UU, "big pads")
+end
+
+local function setPadVisual(pad: Pad)
+	local glow = pad.glow
+	if glow then
+		if pad.isBig then
+			glow.Transparency = if pad.active then 0 else CONFIG.GLOW_OFF_TRANSPARENCY
+		else
+			glow.Transparency = if pad.active then 0 else 1
+		end
+	end
+	local orb = pad.orb
+	if orb then
+		orb.Transparency = if pad.active then 0 else 1
+		local light = orb:FindFirstChildOfClass("PointLight")
+		if light then
+			light.Enabled = pad.active
+		end
+	end
+end
+
+local function setActive(pad: Pad, active: boolean, respawnAt: number)
+	pad.active = active
+	pad.respawnAt = respawnAt
+	pad.model:SetAttribute("Active", active)
+	pad.model:SetAttribute("RespawnAt", respawnAt)
+	setPadVisual(pad)
+end
+
+local function registerPad(model: Model)
+	local isBig = model:GetAttribute("PadType") == "Big"
+	local root = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	if not root then
+		warn("[BOOSTPAD]", model:GetFullName(), "has no parts, skipping it")
+		return
+	end
+	-- pickup centre: pad's ground point + its RL height (70 small / 73 big)
+	local heightUU = model:GetAttribute("PadHeightUU")
+	if typeof(heightUU) ~= "number" then
+		heightUU = if isBig then 73 else 70
+	end
+	local groundPos = Vector3.new(root.Position.X, CONFIG.FLOOR_Y, root.Position.Z)
+	local radius = (if isBig then CONFIG.BIG_PICKUP_RADIUS_UU else CONFIG.SMALL_PICKUP_RADIUS_UU) * S
+
+	local glow = model:FindFirstChild("Glow")
+	local orb = model:FindFirstChild("Orb")
+	local pad: Pad = {
+		model = model,
+		isBig = isBig,
+		pos = groundPos + Vector3.new(0, heightUU * S, 0),
+		radiusSq = radius * radius,
+		amount = if isBig then CONFIG.BIG_AMOUNT else CONFIG.SMALL_AMOUNT,
+		respawnTime = if isBig then CONFIG.BIG_RESPAWN_TIME else CONFIG.SMALL_RESPAWN_TIME,
+		active = true,
+		respawnAt = 0,
+		glow = if glow and glow:IsA("BasePart") then glow else nil,
+		orb = if orb and orb:IsA("BasePart") then orb else nil,
+	}
+	model:SetAttribute("Amount", pad.amount)
+	model:SetAttribute("RespawnTime", pad.respawnTime)
+	CollectionService:AddTag(model, CONFIG.PAD_TAG)
+	CollectionService:AddTag(model, TAG_NOT_DRIVABLE) -- wheel rays ignore pads
+	setActive(pad, true, 0)
+	table.insert(pads, pad)
+end
+
+local function setupPads()
+	local padFolder = workspace:FindFirstChild(CONFIG.FOLDER_NAME)
+	local hasOwn = false
+	if padFolder then
+		for _, child in padFolder:GetChildren() do
+			if child:IsA("Model") and child:GetAttribute("PadType") ~= nil then
+				hasOwn = true
+				break
+			end
+		end
+	end
+
+	if not hasOwn then
+		if not CONFIG.AUTO_BUILD_PADS then
+			warn("[BOOSTPAD] no pads in Workspace >", CONFIG.FOLDER_NAME, "and AUTO_BUILD_PADS is off")
+			return
+		end
+		if padFolder then
+			padFolder:Destroy()
+		end
+		local newFolder = Instance.new("Folder")
+		newFolder.Name = CONFIG.FOLDER_NAME
+		buildAllPads(newFolder)
+		newFolder.Parent = workspace
+		padFolder = newFolder
+	else
+		log("using your own pads in Workspace >", CONFIG.FOLDER_NAME)
+	end
+
+	for _, child in (padFolder :: Instance):GetChildren() do
+		if child:IsA("Model") and child:GetAttribute("PadType") ~= nil then
+			registerPad(child)
+		end
+	end
+	log("tracking", #pads, "pads")
+end
+
+--============================================================
+-- Cars
+--============================================================
+local carHitboxes: { [Model]: BasePart } = {}
+
+local function findHitbox(model: Model): BasePart?
+	for _, d in model:GetDescendants() do
+		if d:IsA("BasePart") and CollectionService:HasTag(d, TAG_CAR_HITBOX) then
+			return d
+		end
+	end
+	local hb = model:FindFirstChild(CONFIG.CAR_HITBOX_NAME, true)
+	if hb and hb:IsA("BasePart") then
+		return hb
+	end
+	return model.PrimaryPart
+end
+
+local function onCarAdded(inst: Instance)
+	if not inst:IsA("Model") then
+		return
+	end
+	-- the hitbox may be parented a moment after the tag lands
+	task.defer(function()
+		local hb = findHitbox(inst)
+		if hb then
+			carHitboxes[inst] = hb
+			log("tracking car", inst.Name)
+		end
+	end)
+end
+
+local function onCarRemoved(inst: Instance)
+	if inst:IsA("Model") then
+		carHitboxes[inst] = nil
+	end
+end
+
+local function ownerOf(car: Model): Player?
+	local userId = car:GetAttribute("OwnerUserId")
+	if typeof(userId) == "number" then
+		return Players:GetPlayerByUserId(userId)
+	end
+	return nil
+end
+
+--============================================================
+-- Pickup
+--============================================================
+local function giveBoost(car: Model, current: number, amount: number)
+	local carEvents = ServerStorage:FindFirstChild(CONFIG.CAR_EVENTS_FOLDER)
+	local addBoost = carEvents and carEvents:FindFirstChild(CONFIG.ADD_BOOST_EVENT)
+	if addBoost and addBoost:IsA("BindableEvent") then
+		addBoost:Fire(car, amount)
+	else
+		car:SetAttribute("Boost", math.min(CONFIG.BOOST_MAX, current + amount))
+	end
+end
+
+local function pickUp(pad: Pad, car: Model, current: number, now: number)
+	giveBoost(car, current, pad.amount)
+	setActive(pad, false, now + pad.respawnTime)
+
+	local player = ownerOf(car)
+	evPickedUp:Fire(player, car, pad.isBig, pad.amount)
+	remotePickup:FireAllClients(pad.model, car, pad.isBig)
+
+	log(
+		player and player.Name or car.Name,
+		"took", pad.model.Name,
+		"| boost", string.format("%.0f", current), "->", string.format("%.0f", math.min(CONFIG.BOOST_MAX, current + pad.amount)),
+		"| back in", pad.respawnTime, "s"
+	)
+end
+
+local function step()
+	local now = workspace:GetServerTimeNow()
+
+	-- respawn timers
+	for _, pad in pads do
+		if not pad.active and now >= pad.respawnAt then
+			setActive(pad, true, 0)
+		end
+	end
+
+	-- pickups: RL's cylinder-around-the-pad test against each car's position
+	for car, hitbox in carHitboxes do
+		if not hitbox.Parent or not car:IsDescendantOf(workspace) then
+			continue
+		end
+		if car:GetAttribute("Demolished") == true then
+			continue
+		end
+		local boost = car:GetAttribute("Boost")
+		if typeof(boost) ~= "number" then
+			continue
+		end
+		local pos = hitbox.Position
+		for _, pad in pads do
+			if not pad.active then
+				continue
+			end
+			if boost >= CONFIG.BOOST_MAX and not CONFIG.PICKUP_WHEN_FULL then
+				break
+			end
+			local dx, dz = pos.X - pad.pos.X, pos.Z - pad.pos.Z
+			if dx * dx + dz * dz < pad.radiusSq and math.abs(pos.Y - pad.pos.Y) < PICKUP_HEIGHT then
+				pickUp(pad, car, boost, now)
+				boost = math.min(CONFIG.BOOST_MAX, boost + pad.amount)
+			end
+		end
+	end
+end
+
+--============================================================
+-- Boot
+--============================================================
+setupPads()
+
+for _, car in CollectionService:GetTagged(TAG_CAR) do
+	onCarAdded(car)
+end
+CollectionService:GetInstanceAddedSignal(TAG_CAR):Connect(onCarAdded)
+CollectionService:GetInstanceRemovedSignal(TAG_CAR):Connect(onCarRemoved)
+
+evResetPads.Event:Connect(function()
+	for _, pad in pads do
+		setActive(pad, true, 0)
+	end
+	log("all pads reset (kickoff)")
+end)
+
+RunService.PostSimulation:Connect(step)
+
+log(
+	"BoostPadServer ready | small +", CONFIG.SMALL_AMOUNT, "every", CONFIG.SMALL_RESPAWN_TIME,
+	"s | big +", CONFIG.BIG_AMOUNT, "every", CONFIG.BIG_RESPAWN_TIME,
+	"s | pickup radius", string.format("%.2f / %.2f", CONFIG.SMALL_PICKUP_RADIUS_UU * S, CONFIG.BIG_PICKUP_RADIUS_UU * S), "studs"
+)

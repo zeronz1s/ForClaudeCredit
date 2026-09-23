@@ -1,0 +1,230 @@
+--[[
+	============================================================
+	Script name : BoostPadClient
+	Class type  : LocalScript
+	Parent      : StarterPlayer > StarterPlayerScripts
+	============================================================
+	Boost pad looks only. The server (BoostPadServer) decides every
+	pickup and respawn; this script just makes the pads look alive:
+
+	  * Big pad orbs spin and bob, their ring pulses.
+	  * Small pad glows pulse.
+	  * A pickup plays a quick "pop" (the orb/glow swells and fades)
+	    and an optional sound.
+	  * When a pad comes back it fades in instead of blinking on.
+
+	Reads each pad Model's "Active" attribute and listens to
+	ReplicatedStorage > Remotes > BoostPickup. Sends nothing to the
+	server.
+]]
+
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+
+local RLShared = require(ReplicatedStorage:WaitForChild("RLShared"))
+
+--============================================================
+-- CONFIG  (every tunable number lives here)
+--============================================================
+local CONFIG = {
+	-- Debug -------------------------------------------------------
+	DEBUG = false,                   -- prints [BOOSTPAD] client logs
+
+	-- Idle animation ----------------------------------------------
+	ORB_SPIN_SPEED = 1.6,            -- radians per second
+	ORB_BOB_HEIGHT = 0.35,           -- studs up and down
+	ORB_BOB_SPEED = 2.2,             -- radians per second
+	GLOW_PULSE_SPEED = 3,            -- radians per second
+	GLOW_PULSE_MIN = 0,              -- transparency at the brightest point
+	GLOW_PULSE_MAX = 0.3,            -- transparency at the dimmest point
+	BIG_RING_OFF_TRANSPARENCY = 0.85,-- big pad ring while the orb is gone
+	FADE_IN_TIME = 0.35,             -- seconds for a pad to fade back in
+
+	-- Pickup pop --------------------------------------------------
+	POP_TIME = 0.3,                  -- seconds
+	POP_SCALE = 1.8,                 -- how much the popped copy grows
+	-- Optional sounds: paste an rbxassetid:// id (Toolbox > Audio). "" = silent.
+	SMALL_PICKUP_SOUND = "",
+	BIG_PICKUP_SOUND = "",
+	SOUND_VOLUME = 0.6,
+	ONLY_MY_PICKUP_SOUNDS = false,   -- true = only hear pads your own car takes
+
+	-- Names -------------------------------------------------------
+	PAD_TAG = "BoostPad",
+	REMOTE_PICKUP = RLShared.REMOTES.BOOST_PICKUP or "BoostPickup",
+}
+
+--============================================================
+-- DEBUG
+--============================================================
+local function log(...)
+	if CONFIG.DEBUG then
+		print("[BOOSTPAD]", ...)
+	end
+end
+
+local player = Players.LocalPlayer
+
+--============================================================
+-- Pad state (local only)
+--============================================================
+type PadFx = {
+	model: Model,
+	isBig: boolean,
+	glow: BasePart?,
+	orb: BasePart?,
+	orbHome: CFrame?,
+	fadeIn: number,        -- 0..1, 1 = fully visible
+	phase: number,         -- so pads don't pulse in sync
+}
+local fxByModel: { [Model]: PadFx } = {}
+
+local function addPad(inst: Instance)
+	if not inst:IsA("Model") or fxByModel[inst] then
+		return
+	end
+	local glow = inst:WaitForChild("Glow", 5)
+	local isBig = inst:GetAttribute("PadType") == "Big"
+	local orb = if isBig then inst:WaitForChild("Orb", 5) else nil
+	local fx: PadFx = {
+		model = inst,
+		isBig = isBig,
+		glow = if glow and glow:IsA("BasePart") then glow else nil,
+		orb = if orb and orb:IsA("BasePart") then orb else nil,
+		orbHome = if orb and orb:IsA("BasePart") then orb.CFrame else nil,
+		fadeIn = if inst:GetAttribute("Active") == false then 0 else 1,
+		phase = math.random() * math.pi * 2,
+	}
+	fxByModel[inst] = fx
+	inst:GetAttributeChangedSignal("Active"):Connect(function()
+		if inst:GetAttribute("Active") then
+			fx.fadeIn = 0 -- fade back in
+		end
+	end)
+end
+
+local function removePad(inst: Instance)
+	if inst:IsA("Model") then
+		fxByModel[inst] = nil
+	end
+end
+
+--============================================================
+-- Pickup pop + sound
+--============================================================
+local function pop(part: BasePart)
+	local ghost = part:Clone()
+	for _, child in ghost:GetChildren() do
+		child:Destroy()
+	end
+	ghost.Name = "PopFx"
+	ghost.Transparency = 0
+	ghost.Anchored = true
+	ghost.CanCollide = false
+	ghost.CanQuery = false
+	ghost.CanTouch = false
+	ghost.Parent = workspace
+	local tween = TweenService:Create(ghost, TweenInfo.new(CONFIG.POP_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = ghost.Size * CONFIG.POP_SCALE,
+		Transparency = 1,
+	})
+	tween:Play()
+	tween.Completed:Once(function()
+		ghost:Destroy()
+	end)
+end
+
+local function playSound(id: string, at: BasePart)
+	if id == "" then
+		return
+	end
+	local s = Instance.new("Sound")
+	s.SoundId = id
+	s.Volume = CONFIG.SOUND_VOLUME
+	s.Parent = at
+	s:Play()
+	s.Ended:Once(function()
+		s:Destroy()
+	end)
+end
+
+local function onPickup(padModel: Model?, carModel: Model?, isBig: boolean)
+	if not padModel then
+		return
+	end
+	local fx = fxByModel[padModel]
+	if fx then
+		fx.fadeIn = 0
+		local part = if fx.isBig then fx.orb else fx.glow
+		if part then
+			pop(part)
+		end
+	end
+
+	local mine = carModel ~= nil and carModel:GetAttribute("OwnerUserId") == player.UserId
+	if CONFIG.ONLY_MY_PICKUP_SOUNDS and not mine then
+		return
+	end
+	local at = padModel.PrimaryPart or padModel:FindFirstChildWhichIsA("BasePart")
+	if at then
+		playSound(if isBig then CONFIG.BIG_PICKUP_SOUND else CONFIG.SMALL_PICKUP_SOUND, at)
+	end
+	log("pickup", padModel.Name, "big:", isBig, "mine:", mine)
+end
+
+--============================================================
+-- Per-frame animation
+--============================================================
+local function render(dt: number)
+	local t = os.clock()
+	for model, fx in fxByModel do
+		if not model.Parent then
+			fxByModel[model] = nil
+			continue
+		end
+		local active = model:GetAttribute("Active") ~= false
+		if active and fx.fadeIn < 1 then
+			fx.fadeIn = math.min(1, fx.fadeIn + dt / CONFIG.FADE_IN_TIME)
+		end
+		local visible = if active then fx.fadeIn else 0
+
+		local glow = fx.glow
+		if glow then
+			local pulse = (math.sin(t * CONFIG.GLOW_PULSE_SPEED + fx.phase) + 1) / 2
+			local lit = CONFIG.GLOW_PULSE_MIN + (CONFIG.GLOW_PULSE_MAX - CONFIG.GLOW_PULSE_MIN) * pulse
+			local off = if fx.isBig then CONFIG.BIG_RING_OFF_TRANSPARENCY else 1
+			glow.Transparency = off + (lit - off) * visible
+		end
+
+		local orb = fx.orb
+		if orb and fx.orbHome then
+			orb.Transparency = 1 - visible
+			if visible > 0 then
+				local bob = math.sin(t * CONFIG.ORB_BOB_SPEED + fx.phase) * CONFIG.ORB_BOB_HEIGHT
+				orb.CFrame = fx.orbHome * CFrame.new(0, bob, 0) * CFrame.Angles(0, t * CONFIG.ORB_SPIN_SPEED, 0)
+			end
+		end
+	end
+end
+
+--============================================================
+-- Boot
+--============================================================
+for _, inst in CollectionService:GetTagged(CONFIG.PAD_TAG) do
+	task.spawn(addPad, inst)
+end
+CollectionService:GetInstanceAddedSignal(CONFIG.PAD_TAG):Connect(function(inst)
+	task.spawn(addPad, inst)
+end)
+CollectionService:GetInstanceRemovedSignal(CONFIG.PAD_TAG):Connect(removePad)
+
+local remotes = ReplicatedStorage:WaitForChild(RLShared.FOLDERS.REMOTES)
+local remotePickup = remotes:WaitForChild(CONFIG.REMOTE_PICKUP) :: RemoteEvent
+remotePickup.OnClientEvent:Connect(onPickup)
+
+RunService.RenderStepped:Connect(render)
+
+log("BoostPadClient ready")

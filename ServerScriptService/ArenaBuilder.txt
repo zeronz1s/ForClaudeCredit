@@ -1,0 +1,802 @@
+--[[
+	============================================================
+	Script name : ArenaBuilder
+	Class type  : Script (server)
+	Parent      : ServerScriptService
+	============================================================
+	Builds a standard Rocket League soccar arena (DFH Stadium size)
+	when the server starts.
+
+	What it builds (all inside Workspace > Arena)
+	  * Floor with grass stripes, invisible ceiling.
+	  * Side walls, back walls and the four 45 degree corner walls.
+	  * Curved quarter-pipe ramps where the floor meets every wall and
+	    where every wall meets the ceiling, so cars can drive up onto
+	    the walls and ceiling like in RL.
+	  * Both goals (mouth, net box, team-colour posts and crossbar).
+	  * Field markings (centre line, centre circle, goal boxes).
+	Outside Workspace > Arena
+	  * Workspace > Goals > BlueGoal / OrangeGoal: the goal trigger
+	    volumes BallServer reads (tag "Goal", attribute Team = the team
+	    that DEFENDS it). They replace BallServer's test goals.
+	  * Workspace > CarSpawns: RL's 5 kickoff spots per team, read by
+	    CarController. Attributes Team ("Blue"/"Orange") and
+	    KickoffIndex (1 right diagonal, 2 left diagonal, 3 back right,
+	    4 back left, 5 far back centre). Front face = car forward.
+	  * Workspace > CarRespawns: RL's 4 demolition respawn spots per
+	    team (for the match loop / demolitions later).
+
+	Sources for every RL number (1 uu = 1 cm):
+	  RLBot wiki "Useful Game Values" and RocketSim RLConst.h
+	  side wall x = +/-4096, back wall y = +/-5120, ceiling z = 2044,
+	  corner planes |x| + |y| = 8064 (1629 uu long, 45 degrees),
+	  goal half width 892.755, goal height 642.775, goal depth 880,
+	  goal line for scoring y = 5124.25 (+ ball radius 91.25),
+	  arena friction 0.6, restitution 0.3, kickoff + respawn spots.
+	  Ramp radius 256 uu is the community-measured floor/wall curve
+	  (RLUtilities uses 250 for the same curve). Field markings are
+	  eyeballed from DFH Stadium, not measured.
+
+	Coordinates: RL x -> Roblox X, RL y -> Roblox Z, RL z (up) ->
+	Roblox Y. Blue defends -Z, Orange defends +Z (same as BallServer).
+	Scale comes from ReplicatedStorage > RLShared (1 stud = 25 uu).
+]]
+
+local Lighting = game:GetService("Lighting")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local RLShared = require(ReplicatedStorage:WaitForChild("RLShared"))
+
+--============================================================
+-- CONFIG  (every tunable number lives here)
+--============================================================
+local CONFIG = {
+	-- Debug -------------------------------------------------------
+	DEBUG = true,                    -- prints [ARENA] logs to Output
+	DEBUG_SHOW_SPAWNS = false,       -- makes kickoff / respawn spots visible (see-through team colour)
+	DEBUG_SHOW_CEILING = false,      -- makes the invisible ceiling see-through so you can check it
+
+	-- Placement ---------------------------------------------------
+	FLOOR_Y = 0,                     -- world Y of the pitch surface (must match BallServer FLOOR_Y)
+	REMOVE_BASEPLATE = true,         -- deletes Workspace.Baseplate at runtime (it sits at Y = 0 and would z-fight the pitch)
+
+	-- Field size (real RL values, in uu) --------------------------
+	SIDE_WALL_X_UU = 4096,           -- side walls at x = +/-4096
+	BACK_WALL_Y_UU = 5120,           -- back walls at y = +/-5120
+	CEILING_Z_UU = 2044,             -- ceiling height
+	CORNER_PLANE_UU = 8064,          -- corner walls lie on |x| + |y| = 8064
+
+	-- Goal (real RL values, in uu) --------------------------------
+	GOAL_HALF_WIDTH_UU = 892.755,    -- centre to post
+	GOAL_HEIGHT_UU = 642.775,        -- floor to crossbar
+	GOAL_DEPTH_UU = 880,             -- goal line to back of net
+	GOAL_SCORE_LINE_UU = 5124.25,    -- RL scores once the ball centre passes this + ball radius
+	BALL_RADIUS_UU = 91.25,          -- only used to size the goal trigger volume
+
+	-- Curves ------------------------------------------------------
+	FLOOR_RAMP_RADIUS_UU = 256,      -- radius of the floor-to-wall curve
+	CEILING_RAMP_RADIUS_UU = 256,    -- radius of the wall-to-ceiling curve
+	RAMP_SEGMENTS = 12,              -- flat strips per curve (more = smoother, more parts)
+
+	-- Thickness of the shell (studs) ------------------------------
+	FLOOR_THICKNESS = 4,
+	WALL_THICKNESS = 4,
+	CEILING_THICKNESS = 4,
+	RAMP_THICKNESS = 2,
+	RAMP_OVERLAP = 0.15,             -- studs each ramp strip overlaps its neighbour (hides seams)
+
+	-- Surface physics (RL arena values) ---------------------------
+	SURFACE_FRICTION = 0.6,          -- RL arena friction
+	SURFACE_ELASTICITY = 0.3,        -- RL arena restitution
+	SURFACE_DENSITY = 0.7,
+	SURFACE_FRICTION_WEIGHT = 1,
+	SURFACE_ELASTICITY_WEIGHT = 1,   -- the ball uses weight 100 so its own bounce wins
+
+	-- Look --------------------------------------------------------
+	BLUE_COLOR = Color3.fromRGB(0, 115, 255),
+	ORANGE_COLOR = Color3.fromRGB(255, 125, 0),
+	BLUE_RAMP_COLOR = Color3.fromRGB(22, 52, 110),
+	ORANGE_RAMP_COLOR = Color3.fromRGB(120, 60, 18),
+	RAMP_MATERIAL = Enum.Material.SmoothPlastic,
+	RAMP_TRANSPARENCY = 0.1,
+	WALL_COLOR_BLUE = Color3.fromRGB(150, 190, 255),
+	WALL_COLOR_ORANGE = Color3.fromRGB(255, 205, 160),
+	WALL_MATERIAL = Enum.Material.Glass,
+	WALL_TRANSPARENCY = 0.65,        -- RL side/back walls are see-through
+	CORNER_WALL_TRANSPARENCY = 0.45,
+	GRASS_COLOR_A = Color3.fromRGB(62, 128, 52),
+	GRASS_COLOR_B = Color3.fromRGB(72, 142, 60),
+	GRASS_MATERIAL = Enum.Material.Grass,
+	GRASS_STRIPES = 16,              -- stripes along the length of the pitch
+	TRIM_WIDTH = 0.35,               -- studs, neon strip along the top of the floor curve
+	TRIM_TRANSPARENCY = 0.2,
+	GOAL_FRAME_WIDTH_UU = 40,        -- posts and crossbar thickness
+	NET_COLOR = Color3.fromRGB(40, 40, 46),
+	NET_TRANSPARENCY = 0.35,
+	NET_MATERIAL = Enum.Material.DiamondPlate,
+
+	-- Field markings (eyeballed from DFH Stadium, uu) --------------
+	LINE_COLOR = Color3.fromRGB(235, 235, 235),
+	LINE_WIDTH_UU = 40,
+	CENTRE_CIRCLE_RADIUS_UU = 1000,
+	CIRCLE_SEGMENTS = 48,
+	GOAL_BOX_HALF_WIDTH_UU = 1800,   -- white box in front of each goal
+	GOAL_BOX_DEPTH_UU = 1150,
+
+	-- Kickoff and respawn spots (real RL values, blue side, uu) ----
+	-- {x, y, yaw}; yaw in radians from +x toward +y. Orange = both x and y flipped.
+	BUILD_SPAWNS = true,
+	KICKOFF_SPOTS_UU = {
+		{ -2048, -2560, math.pi * 0.25 }, -- 1 right diagonal
+		{ 2048, -2560, math.pi * 0.75 },  -- 2 left diagonal
+		{ -256, -3840, math.pi * 0.5 },   -- 3 back right
+		{ 256, -3840, math.pi * 0.5 },    -- 4 back left
+		{ 0, -4608, math.pi * 0.5 },      -- 5 far back centre
+	},
+	RESPAWN_SPOTS_UU = {
+		{ -2304, -4608, math.pi * 0.5 },
+		{ -2688, -4608, math.pi * 0.5 },
+		{ 2304, -4608, math.pi * 0.5 },
+		{ 2688, -4608, math.pi * 0.5 },
+	},
+	SPAWN_PART_SIZE = Vector3.new(4, 0.2, 5), -- studs; top face sits on the pitch
+
+	-- Lighting / sky ----------------------------------------------
+	APPLY_LIGHTING = true,           -- sunny afternoon like DFH Stadium
+	CLOCK_TIME = 14.5,
+	BRIGHTNESS = 2.5,
+	-- Optional skybox: paste six rbxassetid:// ids from a Toolbox sky. Leave "" to keep your sky.
+	SKY = {
+		Bk = "", Dn = "", Ft = "", Lf = "", Rt = "", Up = "",
+	},
+
+	-- Names -------------------------------------------------------
+	ARENA_NAME = "Arena",
+	GOAL_FOLDER_NAME = "Goals",      -- BallServer CONFIG.GOAL_FOLDER_NAME
+	GOAL_TAG = RLShared.TAGS.GOAL or "Goal",
+	RESPAWN_FOLDER_NAME = "CarRespawns",
+}
+
+--============================================================
+-- DEBUG
+--============================================================
+local function log(...)
+	if CONFIG.DEBUG then
+		print("[ARENA]", ...)
+	end
+end
+
+--============================================================
+-- Derived values (studs)
+--============================================================
+local S = RLShared.STUDS_PER_UU
+local UP = Vector3.yAxis
+local TAG_NOT_DRIVABLE = RLShared.TAGS.NOT_DRIVABLE
+
+local WALL_X = CONFIG.SIDE_WALL_X_UU * S
+local WALL_Y = CONFIG.BACK_WALL_Y_UU * S
+local HEIGHT = CONFIG.CEILING_Z_UU * S
+local CORNER = CONFIG.CORNER_PLANE_UU * S
+local CORNER_SIDE_Y = CORNER - WALL_X       -- where a side wall meets its corner wall (y)
+local CORNER_BACK_X = CORNER - WALL_Y       -- where a back wall meets its corner wall (x)
+local GOAL_HW = CONFIG.GOAL_HALF_WIDTH_UU * S
+local GOAL_H = CONFIG.GOAL_HEIGHT_UU * S
+local GOAL_D = CONFIG.GOAL_DEPTH_UU * S
+local FLOOR_R = CONFIG.FLOOR_RAMP_RADIUS_UU * S
+local CEIL_R = CONFIG.CEILING_RAMP_RADIUS_UU * S
+local T_FLOOR = CONFIG.FLOOR_THICKNESS
+local T_WALL = CONFIG.WALL_THICKNESS
+local T_CEIL = CONFIG.CEILING_THICKNESS
+local T_RAMP = CONFIG.RAMP_THICKNESS
+local DIAG = math.sqrt(0.5)
+local CORNER_TURN = math.pi / 4              -- walls meet at 45 degree turns
+
+-- (x, y) on the RL pitch plane in studs + height above the floor -> world position
+local function world(x: number, y: number, h: number): Vector3
+	return Vector3.new(x, CONFIG.FLOOR_Y + h, y)
+end
+
+local function flat(v: Vector2): Vector3
+	return Vector3.new(v.X, 0, v.Y)
+end
+
+local arenaPhysics = PhysicalProperties.new(
+	CONFIG.SURFACE_DENSITY,
+	CONFIG.SURFACE_FRICTION,
+	CONFIG.SURFACE_ELASTICITY,
+	CONFIG.SURFACE_FRICTION_WEIGHT,
+	CONFIG.SURFACE_ELASTICITY_WEIGHT
+)
+
+local partCount = 0
+
+local function teamFor(y: number): string
+	return if y < 0 then "Blue" else "Orange"
+end
+
+local function teamColor(team: string): Color3
+	return if team == "Blue" then CONFIG.BLUE_COLOR else CONFIG.ORANGE_COLOR
+end
+
+--============================================================
+-- Part factory
+--============================================================
+type PartSpec = {
+	name: string,
+	parent: Instance,
+	size: Vector3,
+	cframe: CFrame,
+	color: Color3,
+	material: Enum.Material?,
+	transparency: number?,
+	solid: boolean,          -- true = cars and ball collide with it
+}
+
+local function newPart(spec: PartSpec): Part
+	local p = Instance.new("Part")
+	p.Name = spec.name
+	p.Anchored = true
+	p.Size = spec.size
+	p.CFrame = spec.cframe
+	p.Color = spec.color
+	p.Material = spec.material or Enum.Material.SmoothPlastic
+	p.Transparency = spec.transparency or 0
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.CanTouch = false
+	if spec.solid then
+		p.CanCollide = true
+		p.CanQuery = true
+		p.CustomPhysicalProperties = arenaPhysics
+	else
+		-- decoration: no collision, wheel rays and the ball ignore it
+		p.CanCollide = false
+		p.CanQuery = false
+		p.CastShadow = false
+	end
+	p.Parent = spec.parent
+	partCount += 1
+	return p
+end
+
+local function folder(parent: Instance, name: string): Folder
+	local f = Instance.new("Folder")
+	f.Name = name
+	f.Parent = parent
+	return f
+end
+
+--============================================================
+-- Wall geometry
+--============================================================
+-- A wall run goes from a to b on the pitch plane (studs) with its
+-- inward normal n (unit, points into the arena).
+type Run = {
+	name: string,
+	a: Vector2,
+	b: Vector2,
+	n: Vector2,
+	turnA: number,   -- angle to the neighbour wall at a (0 = free end or straight)
+	turnB: number,
+	team: string,
+}
+
+-- Flat vertical wall panel between heights h0 and h1. Its inner face is
+-- on the wall line; it grows outward by T_WALL. extendA/B push it past
+-- its ends (outside a convex corner that stays hidden behind the neighbour).
+local function wallPanel(parent: Instance, run: Run, h0: number, h1: number, extendA: number, extendB: number, transparency: number)
+	local A = world(run.a.X, run.a.Y, 0)
+	local B = world(run.b.X, run.b.Y, 0)
+	local along = (B - A).Unit
+	local inward = flat(run.n).Unit
+	local length = (B - A).Magnitude + extendA + extendB
+	local mid = (A + B) / 2 + along * ((extendB - extendA) / 2)
+	local center = mid + UP * ((h0 + h1) / 2) - inward * (T_WALL / 2)
+	newPart({
+		name = run.name,
+		parent = parent,
+		size = Vector3.new(length, h1 - h0, T_WALL),
+		cframe = CFrame.fromMatrix(center, along, UP),
+		color = if run.team == "Blue" then CONFIG.WALL_COLOR_BLUE else CONFIG.WALL_COLOR_ORANGE,
+		material = CONFIG.WALL_MATERIAL,
+		transparency = transparency,
+		solid = true,
+	})
+end
+
+-- Quarter-pipe along a wall run. kind "Floor" = floor-to-wall curve,
+-- "Ceiling" = wall-to-ceiling curve. Built from RAMP_SEGMENTS flat
+-- strips whose inner faces are chords of the arc, so the surface the
+-- car and ball touch is the curve itself (every seam is a valley, never
+-- a lip). Strip ends are mitred at 45 degree corners.
+local function rampRun(parent: Instance, run: Run, kind: string)
+	local r = if kind == "Floor" then FLOOR_R else CEIL_R
+	local vert = if kind == "Floor" then UP else -UP   -- away from the floor/ceiling, into the arena
+	local baseH = if kind == "Floor" then 0 else HEIGHT
+
+	local A = world(run.a.X, run.a.Y, baseH)
+	local B = world(run.b.X, run.b.Y, baseH)
+	local along = (B - A).Unit
+	local wallLen = (B - A).Magnitude
+	local inward = flat(run.n).Unit
+	local color = if run.team == "Blue" then CONFIG.BLUE_RAMP_COLOR else CONFIG.ORANGE_RAMP_COLOR
+	local segments = CONFIG.RAMP_SEGMENTS
+
+	-- point on the arc: t = 0 on the floor/ceiling (inset r from the wall),
+	-- t = pi/2 on the wall (r away from the floor/ceiling)
+	local function arc(t: number): (number, number)
+		return r - r * math.sin(t), r - r * math.cos(t)
+	end
+
+	for i = 1, segments do
+		local t0 = (i - 1) / segments * math.pi / 2
+		local t1 = i / segments * math.pi / 2
+		local in0, h0 = arc(t0)
+		local in1, h1 = arc(t1)
+		local midIn, midH = (in0 + in1) / 2, (h0 + h1) / 2
+		local chord = math.sqrt((in1 - in0) ^ 2 + (h1 - h0) ^ 2)
+
+		-- direction from the arc centre (r, r) to the chord middle = behind the surface
+		local ox, oh = midIn - r, midH - r
+		local om = math.sqrt(ox * ox + oh * oh)
+		ox, oh = ox / om, oh / om
+
+		-- mitre: at a corner the strip at inset d ends d*tan(turn/2) early,
+		-- plus a small overlap that ends up hidden behind the neighbour strip
+		local extA = -midIn * math.tan(run.turnA / 2) + (if run.turnA > 0 then CONFIG.RAMP_OVERLAP else 0)
+		local extB = -midIn * math.tan(run.turnB / 2) + (if run.turnB > 0 then CONFIG.RAMP_OVERLAP else 0)
+		local length = wallLen + extA + extB
+
+		local centre = A
+			+ along * (wallLen / 2 + (extB - extA) / 2)
+			+ inward * (midIn + ox * T_RAMP / 2)
+			+ vert * (midH + oh * T_RAMP / 2)
+		local behind = inward * ox + vert * oh
+		local normal = -behind.Unit -- surface normal, points into the arena
+
+		newPart({
+			name = run.name .. kind .. "Ramp" .. i,
+			parent = parent,
+			size = Vector3.new(length, T_RAMP, chord + CONFIG.RAMP_OVERLAP),
+			cframe = CFrame.fromMatrix(centre, along, normal),
+			color = color,
+			material = CONFIG.RAMP_MATERIAL,
+			transparency = CONFIG.RAMP_TRANSPARENCY,
+			solid = true,
+		})
+	end
+
+	-- neon team trim where the floor curve meets the wall
+	if kind == "Floor" then
+		newPart({
+			name = run.name .. "Trim",
+			parent = parent,
+			size = Vector3.new(wallLen, CONFIG.TRIM_WIDTH, 0.1),
+			cframe = CFrame.fromMatrix((A + B) / 2 + UP * (r + CONFIG.TRIM_WIDTH / 2) + inward * 0.06, along, UP),
+			color = teamColor(run.team),
+			material = Enum.Material.Neon,
+			transparency = CONFIG.TRIM_TRANSPARENCY,
+			solid = false,
+		})
+	end
+end
+
+--============================================================
+-- Arena pieces
+--============================================================
+local function buildFloorAndCeiling(arena: Instance)
+	local f = folder(arena, "Floor")
+	local stripes = CONFIG.GRASS_STRIPES
+	local stripeLen = (WALL_Y * 2) / stripes
+	local width = WALL_X * 2 + T_WALL * 2
+	for i = 1, stripes do
+		local y = -WALL_Y + (i - 0.5) * stripeLen
+		newPart({
+			name = "Grass" .. i,
+			parent = f,
+			size = Vector3.new(width, T_FLOOR, stripeLen),
+			cframe = CFrame.new(world(0, y, -T_FLOOR / 2)),
+			color = if i % 2 == 0 then CONFIG.GRASS_COLOR_A else CONFIG.GRASS_COLOR_B,
+			material = CONFIG.GRASS_MATERIAL,
+			solid = true,
+		})
+	end
+
+	local ceiling = newPart({
+		name = "Ceiling",
+		parent = arena,
+		size = Vector3.new(WALL_X * 2 + T_WALL * 2, T_CEIL, WALL_Y * 2 + T_WALL * 2),
+		cframe = CFrame.new(world(0, 0, HEIGHT + T_CEIL / 2)),
+		color = Color3.fromRGB(200, 220, 255),
+		material = Enum.Material.Glass,
+		transparency = if CONFIG.DEBUG_SHOW_CEILING then 0.85 else 1,
+		solid = true,
+	})
+	ceiling.CastShadow = false
+	log("floor:", stripes, "grass stripes,", string.format("%.1f x %.1f", WALL_X * 2, WALL_Y * 2), "studs | ceiling at", string.format("%.2f", HEIGHT))
+end
+
+local function buildWalls(arena: Instance)
+	local walls = folder(arena, "Walls")
+	local ramps = folder(arena, "Ramps")
+	local bottom, top = -T_FLOOR, HEIGHT + T_CEIL
+
+	-- Side walls (split at midfield for team colours) and corner walls
+	for _, sx in { -1, 1 } do
+		for _, sy in { -1, 1 } do
+			local team = teamFor(sy)
+			local sideName = (if sx < 0 then "Right" else "Left") .. team -- +x is left when looking from Blue at Orange
+
+			-- side wall half, from midfield (y = 0) to the corner
+			local side: Run = {
+				name = sideName .. "Side",
+				a = Vector2.new(sx * WALL_X, 0),
+				b = Vector2.new(sx * WALL_X, sy * CORNER_SIDE_Y),
+				n = Vector2.new(-sx, 0),
+				turnA = 0,
+				turnB = CORNER_TURN,
+				team = team,
+			}
+			wallPanel(walls, side, bottom, top, 0, T_WALL, CONFIG.WALL_TRANSPARENCY)
+			rampRun(ramps, side, "Floor")
+			rampRun(ramps, side, "Ceiling")
+
+			-- corner wall from the side wall to the back wall
+			local corner: Run = {
+				name = sideName .. "Corner",
+				a = Vector2.new(sx * WALL_X, sy * CORNER_SIDE_Y),
+				b = Vector2.new(sx * CORNER_BACK_X, sy * WALL_Y),
+				n = Vector2.new(-sx * DIAG, -sy * DIAG),
+				turnA = CORNER_TURN,
+				turnB = CORNER_TURN,
+				team = team,
+			}
+			wallPanel(walls, corner, bottom, top, T_WALL, T_WALL, CONFIG.CORNER_WALL_TRANSPARENCY)
+			rampRun(ramps, corner, "Floor")
+			rampRun(ramps, corner, "Ceiling")
+
+			-- back wall beside the goal, from the corner to the post
+			local back: Run = {
+				name = sideName .. "Back",
+				a = Vector2.new(sx * CORNER_BACK_X, sy * WALL_Y),
+				b = Vector2.new(sx * GOAL_HW, sy * WALL_Y),
+				n = Vector2.new(0, -sy),
+				turnA = CORNER_TURN,
+				turnB = 0,
+				team = team,
+			}
+			wallPanel(walls, back, bottom, top, T_WALL, 0, CONFIG.WALL_TRANSPARENCY)
+			rampRun(ramps, back, "Floor") -- the goal mouth has no floor curve
+		end
+	end
+
+	-- Back walls above each goal + the ceiling curve along the whole back wall
+	for _, sy in { -1, 1 } do
+		local team = teamFor(sy)
+		local over: Run = {
+			name = team .. "BackOverGoal",
+			a = Vector2.new(GOAL_HW, sy * WALL_Y),
+			b = Vector2.new(-GOAL_HW, sy * WALL_Y),
+			n = Vector2.new(0, -sy),
+			turnA = 0,
+			turnB = 0,
+			team = team,
+		}
+		wallPanel(walls, over, GOAL_H, top, 0, 0, CONFIG.WALL_TRANSPARENCY)
+
+		local backCeiling: Run = {
+			name = team .. "Back",
+			a = Vector2.new(CORNER_BACK_X, sy * WALL_Y),
+			b = Vector2.new(-CORNER_BACK_X, sy * WALL_Y),
+			n = Vector2.new(0, -sy),
+			turnA = CORNER_TURN,
+			turnB = CORNER_TURN,
+			team = team,
+		}
+		rampRun(ramps, backCeiling, "Ceiling")
+	end
+	log("walls, corners and curves built | curve radius", string.format("%.2f", FLOOR_R), "studs,", CONFIG.RAMP_SEGMENTS, "strips each")
+end
+
+local function buildGoal(arena: Instance, sy: number)
+	local team = teamFor(sy)
+	local g = folder(arena, team .. "GoalBox")
+	local back = sy * (WALL_Y + GOAL_D)
+	local midY = sy * (WALL_Y + GOAL_D / 2)
+	local outerW = GOAL_HW * 2 + T_WALL * 2
+
+	-- goal floor (the main pitch stops at the goal line)
+	newPart({
+		name = "GoalFloor",
+		parent = g,
+		size = Vector3.new(outerW, T_FLOOR, GOAL_D + T_WALL),
+		cframe = CFrame.new(world(0, sy * (WALL_Y + (GOAL_D + T_WALL) / 2), -T_FLOOR / 2)),
+		color = CONFIG.GRASS_COLOR_A,
+		material = CONFIG.GRASS_MATERIAL,
+		solid = true,
+	})
+	-- net: back, sides, roof
+	newPart({
+		name = "NetBack",
+		parent = g,
+		size = Vector3.new(outerW, GOAL_H + T_CEIL, T_WALL),
+		cframe = CFrame.new(world(0, back + sy * T_WALL / 2, (GOAL_H + T_CEIL) / 2)),
+		color = CONFIG.NET_COLOR,
+		material = CONFIG.NET_MATERIAL,
+		transparency = CONFIG.NET_TRANSPARENCY,
+		solid = true,
+	})
+	for _, sx in { -1, 1 } do
+		newPart({
+			name = "NetSide",
+			parent = g,
+			size = Vector3.new(T_WALL, GOAL_H + T_CEIL, GOAL_D),
+			cframe = CFrame.new(world(sx * (GOAL_HW + T_WALL / 2), midY, (GOAL_H + T_CEIL) / 2)),
+			color = CONFIG.NET_COLOR,
+			material = CONFIG.NET_MATERIAL,
+			transparency = CONFIG.NET_TRANSPARENCY,
+			solid = true,
+		})
+	end
+	newPart({
+		name = "NetRoof",
+		parent = g,
+		size = Vector3.new(outerW, T_CEIL, GOAL_D),
+		cframe = CFrame.new(world(0, midY, GOAL_H + T_CEIL / 2)),
+		color = CONFIG.NET_COLOR,
+		material = CONFIG.NET_MATERIAL,
+		transparency = CONFIG.NET_TRANSPARENCY,
+		solid = true,
+	})
+
+	-- team-colour posts and crossbar painted on the goal mouth (decoration)
+	local fw = CONFIG.GOAL_FRAME_WIDTH_UU * S
+	local lineY = sy * (WALL_Y - 0.06)
+	for _, sx in { -1, 1 } do
+		newPart({
+			name = "Post",
+			parent = g,
+			size = Vector3.new(fw, GOAL_H, 0.1),
+			cframe = CFrame.new(world(sx * (GOAL_HW + fw / 2), lineY, GOAL_H / 2)),
+			color = teamColor(team),
+			material = Enum.Material.Neon,
+			solid = false,
+		})
+	end
+	newPart({
+		name = "Crossbar",
+		parent = g,
+		size = Vector3.new(GOAL_HW * 2 + fw * 2, fw, 0.1),
+		cframe = CFrame.new(world(0, lineY, GOAL_H + fw / 2)),
+		color = teamColor(team),
+		material = Enum.Material.Neon,
+		solid = false,
+	})
+end
+
+--============================================================
+-- Goal trigger volumes for BallServer
+--============================================================
+-- BallServer scores when the WHOLE ball is inside a volume. The front
+-- face sits on RL's goal line (5124.25) and the box is a ball-radius
+-- wider/taller than the goal, so only "past the line" decides, exactly
+-- like RL's y > 5124.25 + radius rule.
+local function buildGoalVolumes()
+	local goals = workspace:FindFirstChild(CONFIG.GOAL_FOLDER_NAME)
+	if goals then
+		for _, child in goals:GetChildren() do
+			child:Destroy() -- BallServer's auto test goals, or an older build
+		end
+	else
+		goals = folder(workspace, CONFIG.GOAL_FOLDER_NAME)
+	end
+
+	local r = CONFIG.BALL_RADIUS_UU * S
+	local pad = 2 -- studs of slack around the goal
+	local lineY = CONFIG.GOAL_SCORE_LINE_UU * S
+	local backY = WALL_Y + GOAL_D + r + pad
+	local width = (GOAL_HW + r + pad) * 2
+	local bottomH, topH = -(r + pad), GOAL_H + r + pad
+	local depth = backY - lineY
+
+	local made = {}
+	for _, sy in { -1, 1 } do
+		local team = teamFor(sy)
+		local p = Instance.new("Part")
+		p.Name = team .. "Goal"
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanTouch = false
+		p.CanQuery = false
+		p.Transparency = 1
+		p.Size = Vector3.new(width, topH - bottomH, depth)
+		p.CFrame = CFrame.new(world(0, sy * (lineY + depth / 2), (bottomH + topH) / 2))
+		p:SetAttribute("Team", team) -- the team that DEFENDS this goal
+		p.Parent = goals
+		table.insert(made, p)
+	end
+	-- tag last: BallServer re-scans its goals when the tag appears
+	for _, p in made do
+		CollectionService:AddTag(p, CONFIG.GOAL_TAG)
+	end
+	log("goal volumes placed, front face at +/-", string.format("%.2f", lineY), "studs (RL goal line)")
+end
+
+--============================================================
+-- Field markings (decoration only)
+--============================================================
+local function line(parent: Instance, name: string, a: Vector2, b: Vector2)
+	local w = CONFIG.LINE_WIDTH_UU * S
+	local A, B = world(a.X, a.Y, 0.03), world(b.X, b.Y, 0.03)
+	local along = (B - A).Unit
+	newPart({
+		name = name,
+		parent = parent,
+		size = Vector3.new((B - A).Magnitude + w, 0.05, w),
+		cframe = CFrame.fromMatrix((A + B) / 2, along, UP),
+		color = CONFIG.LINE_COLOR,
+		material = Enum.Material.SmoothPlastic,
+		solid = false,
+	})
+end
+
+local function buildMarkings(arena: Instance)
+	local m = folder(arena, "Markings")
+	local edge = WALL_X - FLOOR_R -- lines stop where the curve starts
+	line(m, "CentreLine", Vector2.new(-edge, 0), Vector2.new(edge, 0))
+
+	local cr = CONFIG.CENTRE_CIRCLE_RADIUS_UU * S
+	local n = CONFIG.CIRCLE_SEGMENTS
+	for i = 1, n do
+		local a0 = (i - 1) / n * math.pi * 2
+		local a1 = i / n * math.pi * 2
+		line(m, "CentreCircle", Vector2.new(math.cos(a0) * cr, math.sin(a0) * cr), Vector2.new(math.cos(a1) * cr, math.sin(a1) * cr))
+	end
+
+	local bw = CONFIG.GOAL_BOX_HALF_WIDTH_UU * S
+	local bd = CONFIG.GOAL_BOX_DEPTH_UU * S
+	for _, sy in { -1, 1 } do
+		local team = teamFor(sy)
+		local front = sy * (WALL_Y - bd)
+		line(m, team .. "BoxFront", Vector2.new(-bw, front), Vector2.new(bw, front))
+		line(m, team .. "BoxSide", Vector2.new(-bw, front), Vector2.new(-bw, sy * (WALL_Y - FLOOR_R)))
+		line(m, team .. "BoxSide", Vector2.new(bw, front), Vector2.new(bw, sy * (WALL_Y - FLOOR_R)))
+		line(m, team .. "GoalLine", Vector2.new(-GOAL_HW, sy * WALL_Y), Vector2.new(GOAL_HW, sy * WALL_Y))
+	end
+end
+
+--============================================================
+-- Kickoff + respawn spots
+--============================================================
+local function spawnPart(parent: Instance, name: string, team: string, spot: { number }, index: number, attrName: string)
+	-- RL gives blue spots; orange is the same spot rotated 180 degrees about centre
+	local flip = if team == "Blue" then 1 else -1
+	local x, y = spot[1] * S * flip, spot[2] * S * flip
+	local dir = Vector3.new(math.cos(spot[3]) * flip, 0, math.sin(spot[3]) * flip)
+	local size = CONFIG.SPAWN_PART_SIZE
+	local pos = world(x, y, -size.Y / 2) -- top face on the pitch
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanTouch = false
+	p.CanQuery = false
+	p.CastShadow = false
+	p.Size = size
+	p.CFrame = CFrame.lookAt(pos, pos + dir) -- front face = car forward
+	p.Color = teamColor(team)
+	p.Material = Enum.Material.ForceField
+	p.Transparency = if CONFIG.DEBUG_SHOW_SPAWNS then 0.4 else 1
+	p:SetAttribute("Team", team)
+	p:SetAttribute(attrName, index)
+	p:SetAttribute("BuiltByArena", true)
+	CollectionService:AddTag(p, TAG_NOT_DRIVABLE)
+	p.Parent = parent
+end
+
+local function buildSpawns()
+	local function freshFolder(name: string): Folder?
+		local existing = workspace:FindFirstChild(name)
+		if existing then
+			for _, child in existing:GetChildren() do
+				if not child:GetAttribute("BuiltByArena") then
+					log(name, "already has your own spawn parts, leaving it alone")
+					return nil
+				end
+			end
+			existing:Destroy()
+		end
+		return folder(workspace, name)
+	end
+
+	local kickoff = freshFolder(RLShared.FOLDERS.CAR_SPAWNS)
+	if kickoff then
+		-- alternate teams so CarController's round-robin puts players on both sides
+		for i, spot in CONFIG.KICKOFF_SPOTS_UU do
+			spawnPart(kickoff, "Blue" .. i, "Blue", spot, i, "KickoffIndex")
+			spawnPart(kickoff, "Orange" .. i, "Orange", spot, i, "KickoffIndex")
+		end
+		log("kickoff spots placed:", #CONFIG.KICKOFF_SPOTS_UU, "per team")
+	end
+
+	local respawn = freshFolder(CONFIG.RESPAWN_FOLDER_NAME)
+	if respawn then
+		for i, spot in CONFIG.RESPAWN_SPOTS_UU do
+			spawnPart(respawn, "Blue" .. i, "Blue", spot, i, "RespawnIndex")
+			spawnPart(respawn, "Orange" .. i, "Orange", spot, i, "RespawnIndex")
+		end
+		log("respawn spots placed:", #CONFIG.RESPAWN_SPOTS_UU, "per team")
+	end
+end
+
+--============================================================
+-- Lighting
+--============================================================
+local function applyLighting()
+	if not CONFIG.APPLY_LIGHTING then
+		return
+	end
+	Lighting.ClockTime = CONFIG.CLOCK_TIME
+	Lighting.Brightness = CONFIG.BRIGHTNESS
+
+	local sky = CONFIG.SKY
+	if sky.Bk ~= "" then
+		local existing = Lighting:FindFirstChildOfClass("Sky")
+		if existing then
+			existing:Destroy()
+		end
+		local s = Instance.new("Sky")
+		s.SkyboxBk, s.SkyboxDn, s.SkyboxFt = sky.Bk, sky.Dn, sky.Ft
+		s.SkyboxLf, s.SkyboxRt, s.SkyboxUp = sky.Lf, sky.Rt, sky.Up
+		s.Parent = Lighting
+		log("skybox applied")
+	end
+end
+
+--============================================================
+-- Boot
+--============================================================
+local function build()
+	local started = os.clock()
+
+	if CONFIG.REMOVE_BASEPLATE then
+		local baseplate = workspace:FindFirstChild("Baseplate")
+		if baseplate then
+			baseplate:Destroy()
+			log("removed Baseplate (REMOVE_BASEPLATE = true)")
+		end
+	end
+
+	local old = workspace:FindFirstChild(CONFIG.ARENA_NAME)
+	if old then
+		old:Destroy()
+	end
+
+	local arena = Instance.new("Model")
+	arena.Name = CONFIG.ARENA_NAME
+
+	buildFloorAndCeiling(arena)
+	buildWalls(arena)
+	buildGoal(arena, -1)
+	buildGoal(arena, 1)
+	buildMarkings(arena)
+
+	arena:SetAttribute("StudsPerUU", S)
+	arena:SetAttribute("FloorY", CONFIG.FLOOR_Y)
+	arena.Parent = workspace
+
+	buildGoalVolumes()
+	if CONFIG.BUILD_SPAWNS then
+		buildSpawns()
+	end
+	applyLighting()
+
+	log(
+		"arena built:", partCount, "parts in",
+		string.format("%.2f", os.clock() - started), "s | field",
+		string.format("%.1f x %.1f x %.1f", WALL_X * 2, HEIGHT, WALL_Y * 2), "studs"
+	)
+end
+
+build()
