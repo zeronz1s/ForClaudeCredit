@@ -12,7 +12,9 @@
 	Needs: ReplicatedStorage > RLShared, ReplicatedStorage > CarConfig.
 	Optional: ServerStorage > CarTemplates > <CarConfig.CAR_TEMPLATE_NAME> (a Model;
 	a part named "Hitbox" is used if present, everything else is welded on as visuals).
-	Optional: Workspace > CarSpawns (Parts; each part's front face = car forward).
+	Optional: Workspace > CarSpawns (Parts; each part's front face = car forward;
+	attribute Team = "Blue"/"Orange" picks which team spawns there).
+	Other server scripts add boost with ServerStorage > CarEvents > AddBoost:Fire(carModel, amount).
 ]]
 
 ----------------------------------------------------------------------
@@ -78,6 +80,8 @@ local remotes = RLShared.getOrCreate(ReplicatedStorage, "Folder", RLShared.FOLDE
 local inputRemote = RLShared.getOrCreate(remotes, "UnreliableRemoteEvent", RLShared.REMOTES.CAR_INPUT)
 local spawnedRemote = RLShared.getOrCreate(remotes, "RemoteEvent", RLShared.REMOTES.CAR_SPAWNED)
 local carsFolder = RLShared.getOrCreate(workspace, "Folder", RLShared.FOLDERS.CARS)
+local carEvents = RLShared.getOrCreate(ServerStorage, "Folder", RLShared.FOLDERS.CAR_EVENTS)
+local addBoostEvent = RLShared.getOrCreate(carEvents, "BindableEvent", RLShared.CAR_EVENTS.ADD_BOOST) :: BindableEvent
 
 -- Wheel rays ignore every car, the ball and anything tagged NotDrivable.
 local rayParams = RaycastParams.new()
@@ -178,7 +182,7 @@ local function getTemplate(): Model
 end
 
 -- Turns any model into a drivable car: one colliding hitbox, everything else welded visuals.
-local function prepareCar(model: Model, player: Player): BasePart
+local function prepareCar(model: Model, player: Player, team: string): BasePart
 	local hitbox = model.PrimaryPart :: BasePart
 	hitbox.Size = HITBOX_SIZE
 	hitbox.Anchored = false
@@ -228,6 +232,7 @@ local function prepareCar(model: Model, player: Player): BasePart
 	CollectionService:AddTag(model, RLShared.TAGS.CAR)
 	CollectionService:AddTag(hitbox, RLShared.TAGS.CAR_HITBOX)
 	model:SetAttribute("OwnerUserId", player.UserId)
+	model:SetAttribute("Team", team)
 	model:SetAttribute("Boost", C.BOOST_START)
 	model:SetAttribute("Boosting", false)
 	model:SetAttribute("Grounded", false)
@@ -240,7 +245,7 @@ end
 -- Car state
 ----------------------------------------------------------------------
 local cars = {} -- [Player] = state
-local spawnIndex = 0
+local spawnIndex = {} -- [team] = last spawn used
 
 local function newInput()
 	return {
@@ -268,26 +273,57 @@ local function resetMotionState(st)
 	st.pendingJump = false
 end
 
-local function getSpawnCFrame(): CFrame
+-- Team from player.Team when it is Blue/Orange, otherwise the smaller team.
+local function pickTeam(player: Player): string
+	if player.Team and table.find(RLShared.TEAMS, player.Team.Name) then
+		return player.Team.Name
+	end
+	local counts = {}
+	for _, team in RLShared.TEAMS do
+		counts[team] = 0
+	end
+	for other, st in cars do
+		if other ~= player and counts[st.team] then
+			counts[st.team] += 1
+		end
+	end
+	local best = RLShared.TEAMS[1]
+	for _, team in RLShared.TEAMS do
+		if counts[team] < counts[best] then
+			best = team
+		end
+	end
+	return best
+end
+
+-- Spawn parts with a matching Team attribute first (sorted by KickoffIndex), else any spawn part.
+local function getSpawnCFrame(team: string): CFrame
 	local spawns = workspace:FindFirstChild(RLShared.FOLDERS.CAR_SPAWNS)
-	local parts = {}
+	local teamParts, anyParts = {}, {}
 	if spawns then
 		for _, p in spawns:GetChildren() do
 			if p:IsA("BasePart") then
-				table.insert(parts, p)
+				table.insert(anyParts, p)
+				if p:GetAttribute("Team") == team then
+					table.insert(teamParts, p)
+				end
 			end
 		end
 	end
+	local parts = if #teamParts > 0 then teamParts else anyParts
 	if #parts == 0 then
 		return CFrame.new(0, C.SPAWN_HEIGHT + RIDE_HEIGHT, 0)
 	end
-	spawnIndex = spawnIndex % #parts + 1
-	local p = parts[spawnIndex]
+	table.sort(parts, function(a, b)
+		return (a:GetAttribute("KickoffIndex") or 99) < (b:GetAttribute("KickoffIndex") or 99)
+	end)
+	spawnIndex[team] = (spawnIndex[team] or 0) % #parts + 1
+	local p = parts[spawnIndex[team]]
 	return p.CFrame * CFrame.new(0, p.Size.Y / 2 + C.SPAWN_HEIGHT + RIDE_HEIGHT, 0)
 end
 
 local function placeCar(st)
-	st.model:PivotTo(getSpawnCFrame())
+	st.model:PivotTo(getSpawnCFrame(st.team))
 	st.hitbox.AssemblyLinearVelocity = Vector3.zero
 	st.hitbox.AssemblyAngularVelocity = Vector3.zero
 	resetMotionState(st)
@@ -311,10 +347,12 @@ local function spawnCar(player: Player)
 		player.Character:Destroy()
 	end
 
+	local team = pickTeam(player)
 	local model = getTemplate()
-	local hitbox = prepareCar(model, player)
+	local hitbox = prepareCar(model, player, team)
 	local st = {
 		player = player,
+		team = team,
 		model = model,
 		hitbox = hitbox,
 		input = newInput(),
@@ -326,14 +364,27 @@ local function spawnCar(player: Player)
 	}
 	resetMotionState(st)
 
-	model:PivotTo(getSpawnCFrame())
+	model:PivotTo(getSpawnCFrame(team))
 	model.Parent = carsFolder
 	hitbox:SetNetworkOwner(nil) -- server owns the physics
 	cars[player] = st
 
 	spawnedRemote:FireClient(player, model)
-	log("spawned car for", player.Name)
+	log("spawned car for", player.Name, "team", team)
 end
+
+-- Boost pads (or anything else on the server) refill boost through this event.
+addBoostEvent.Event:Connect(function(model, amount)
+	if typeof(model) ~= "Instance" or not CollectionService:HasTag(model, RLShared.TAGS.CAR) then
+		return
+	end
+	if type(amount) ~= "number" or amount ~= amount then
+		return
+	end
+	local current = model:GetAttribute("Boost") or 0
+	model:SetAttribute("Boost", math.clamp(current + amount, 0, C.BOOST_MAX))
+	log(model.Name, "boost +", amount)
+end)
 
 ----------------------------------------------------------------------
 -- Input (client requests, server decides)
