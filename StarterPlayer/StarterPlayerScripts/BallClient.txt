@@ -1,0 +1,248 @@
+--[[
+	============================================================
+	Script name : BallClient
+	Class type  : LocalScript
+	Parent      : StarterPlayer > StarterPlayerScripts
+	============================================================
+	Client-side ball + goal effects ONLY. It never moves the ball
+	or decides a goal; BallServer does that. This script:
+	  * plays a hit sound when any car touches the ball
+	  * shows the goal explosion where the ball went in
+	  * shows a "GOAL!" banner with the scorer and ball speed
+	  * shows a small Blue - Orange score readout
+
+	Listens to (created by BallServer at runtime):
+	  ReplicatedStorage.Remotes.BallHit    (position, hitSpeedKmh)
+	  ReplicatedStorage.Remotes.GoalScored (scoringTeam, scorerName, ballSpeedKmh, goalPosition, isOwnGoal)
+	  ReplicatedStorage attributes BlueScore / OrangeScore
+
+	Needs ReplicatedStorage > RLShared (from the car controller) for
+	the Remotes folder name.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local RLShared = require(ReplicatedStorage:WaitForChild("RLShared"))
+
+--============================================================
+-- CONFIG
+--============================================================
+local CONFIG = {
+	DEBUG = true,
+
+	-- Sounds: paste a Toolbox audio id (numbers only). 0 = no sound.
+	HIT_SOUND_ID = 0,
+	GOAL_SOUND_ID = 0,
+	HIT_SOUND_MIN_VOLUME = 0.2,     -- volume at a soft touch
+	HIT_SOUND_MAX_VOLUME = 1.0,     -- volume at a full-speed hit
+	HIT_SOUND_FULL_KMH = 150,       -- hit speed (km/h) that plays at max volume
+	HIT_SOUND_MIN_KMH = 5,          -- softer than this = no sound
+
+	-- Goal explosion
+	EXPLOSION_RADIUS = 20,          -- studs, visual only (no knockback, no joint breaking)
+	FLASH_TIME = 0.6,               -- seconds the team-coloured flash sphere lasts
+	FLASH_SIZE = 35,                -- studs, how big the flash sphere grows
+
+	-- Banner
+	BANNER_TIME = 2.5,              -- seconds the GOAL! banner stays up
+	BLUE_COLOR = Color3.fromRGB(0, 115, 255),
+	ORANGE_COLOR = Color3.fromRGB(255, 125, 0),
+	FONT = Enum.Font.GothamBlack,
+	SHOW_SCORE_READOUT = true,
+}
+
+--============================================================
+-- DEBUG
+--============================================================
+local function log(...)
+	if CONFIG.DEBUG then
+		print("[BALL]", ...)
+	end
+end
+
+--============================================================
+-- Setup
+--============================================================
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local remotes = ReplicatedStorage:WaitForChild(RLShared.FOLDERS.REMOTES)
+local remoteBallHit = remotes:WaitForChild(RLShared.REMOTES.BALL_HIT or "BallHit") :: RemoteEvent
+local remoteGoalScored = remotes:WaitForChild(RLShared.REMOTES.GOAL_SCORED or "GoalScored") :: RemoteEvent
+
+local function teamColor(team: string): Color3
+	return if team == "Blue" then CONFIG.BLUE_COLOR else CONFIG.ORANGE_COLOR
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "BallHUD"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = playerGui
+
+-- Goal banner
+local banner = Instance.new("TextLabel")
+banner.Name = "GoalBanner"
+banner.AnchorPoint = Vector2.new(0.5, 0.5)
+banner.Position = UDim2.fromScale(0.5, 0.3)
+banner.Size = UDim2.fromScale(0.6, 0.14)
+banner.BackgroundTransparency = 1
+banner.Font = CONFIG.FONT
+banner.TextScaled = true
+banner.TextColor3 = Color3.new(1, 1, 1)
+banner.TextStrokeTransparency = 0
+banner.Text = ""
+banner.Visible = false
+banner.Parent = gui
+
+local subBanner = Instance.new("TextLabel")
+subBanner.Name = "GoalSubBanner"
+subBanner.AnchorPoint = Vector2.new(0.5, 0)
+subBanner.Position = UDim2.fromScale(0.5, 0.38)
+subBanner.Size = UDim2.fromScale(0.5, 0.05)
+subBanner.BackgroundTransparency = 1
+subBanner.Font = CONFIG.FONT
+subBanner.TextScaled = true
+subBanner.TextColor3 = Color3.new(1, 1, 1)
+subBanner.TextStrokeTransparency = 0.2
+subBanner.Text = ""
+subBanner.Visible = false
+subBanner.Parent = gui
+
+-- Score readout
+local scoreLabel = Instance.new("TextLabel")
+scoreLabel.Name = "Score"
+scoreLabel.AnchorPoint = Vector2.new(0.5, 0)
+scoreLabel.Position = UDim2.new(0.5, 0, 0, 12)
+scoreLabel.Size = UDim2.fromOffset(220, 44)
+scoreLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+scoreLabel.BackgroundTransparency = 0.25
+scoreLabel.Font = CONFIG.FONT
+scoreLabel.TextScaled = true
+scoreLabel.TextColor3 = Color3.new(1, 1, 1)
+scoreLabel.RichText = true
+scoreLabel.Visible = CONFIG.SHOW_SCORE_READOUT
+scoreLabel.Parent = gui
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = scoreLabel
+
+local function refreshScore()
+	local blue = ReplicatedStorage:GetAttribute("BlueScore") or 0
+	local orange = ReplicatedStorage:GetAttribute("OrangeScore") or 0
+	scoreLabel.Text = string.format(
+		'<font color="#%s">%d</font>  -  <font color="#%s">%d</font>',
+		CONFIG.BLUE_COLOR:ToHex(), blue, CONFIG.ORANGE_COLOR:ToHex(), orange
+	)
+end
+refreshScore()
+ReplicatedStorage:GetAttributeChangedSignal("BlueScore"):Connect(refreshScore)
+ReplicatedStorage:GetAttributeChangedSignal("OrangeScore"):Connect(refreshScore)
+
+--============================================================
+-- Effects
+--============================================================
+local function playSoundAt(id: number, position: Vector3, volume: number)
+	if id == 0 then
+		return
+	end
+	local holder = Instance.new("Part")
+	holder.Anchored = true
+	holder.CanCollide = false
+	holder.CanTouch = false
+	holder.CanQuery = false
+	holder.Transparency = 1
+	holder.Size = Vector3.one
+	holder.CFrame = CFrame.new(position)
+	holder.Parent = workspace
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = "rbxassetid://" .. tostring(id)
+	sound.Volume = volume
+	sound.RollOffMaxDistance = 1500
+	sound.Parent = holder
+	sound:Play()
+	Debris:AddItem(holder, 5)
+end
+
+local function onBallHit(position: Vector3, hitKmh: number)
+	if hitKmh < CONFIG.HIT_SOUND_MIN_KMH then
+		return
+	end
+	local t = math.clamp(hitKmh / CONFIG.HIT_SOUND_FULL_KMH, 0, 1)
+	local volume = CONFIG.HIT_SOUND_MIN_VOLUME + (CONFIG.HIT_SOUND_MAX_VOLUME - CONFIG.HIT_SOUND_MIN_VOLUME) * t
+	playSoundAt(CONFIG.HIT_SOUND_ID, position, volume)
+end
+
+local function goalExplosion(position: Vector3, team: string)
+	local explosion = Instance.new("Explosion")
+	explosion.Position = position
+	explosion.BlastRadius = CONFIG.EXPLOSION_RADIUS
+	explosion.BlastPressure = 0            -- visual only
+	explosion.DestroyJointRadiusPercent = 0 -- never breaks anything
+	explosion.Parent = workspace
+
+	local flash = Instance.new("Part")
+	flash.Shape = Enum.PartType.Ball
+	flash.Anchored = true
+	flash.CanCollide = false
+	flash.CanTouch = false
+	flash.CanQuery = false
+	flash.Material = Enum.Material.Neon
+	flash.Color = teamColor(team)
+	flash.Size = Vector3.one * 4
+	flash.CFrame = CFrame.new(position)
+	flash.Transparency = 0.1
+	flash.Parent = workspace
+
+	local tween = TweenService:Create(
+		flash,
+		TweenInfo.new(CONFIG.FLASH_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ Size = Vector3.one * CONFIG.FLASH_SIZE, Transparency = 1 }
+	)
+	tween:Play()
+	Debris:AddItem(flash, CONFIG.FLASH_TIME + 0.1)
+end
+
+local bannerToken = 0
+local function showBanner(team: string, scorerName: string, speedKmh: number, isOwnGoal: boolean)
+	bannerToken += 1
+	local myToken = bannerToken
+
+	banner.Text = if isOwnGoal then "OWN GOAL!" else "GOAL!"
+	banner.TextColor3 = teamColor(team)
+	local who = if scorerName ~= "" then scorerName else team .. " team"
+	subBanner.Text = string.format("%s  |  %d KM/H", string.upper(who), speedKmh)
+	subBanner.TextColor3 = teamColor(team)
+
+	banner.Size = UDim2.fromScale(0.2, 0.05)
+	banner.Visible = true
+	subBanner.Visible = true
+	TweenService:Create(
+		banner,
+		TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{ Size = UDim2.fromScale(0.6, 0.14) }
+	):Play()
+
+	task.delay(CONFIG.BANNER_TIME, function()
+		if bannerToken == myToken then
+			banner.Visible = false
+			subBanner.Visible = false
+		end
+	end)
+end
+
+local function onGoalScored(scoringTeam: string, scorerName: string, speedKmh: number, goalPosition: Vector3, isOwnGoal: boolean)
+	log("goal for", scoringTeam, "by", scorerName, speedKmh, "km/h", isOwnGoal and "(own goal)" or "")
+	goalExplosion(goalPosition, scoringTeam)
+	playSoundAt(CONFIG.GOAL_SOUND_ID, goalPosition, 1)
+	showBanner(scoringTeam, scorerName, speedKmh, isOwnGoal)
+end
+
+remoteBallHit.OnClientEvent:Connect(onBallHit)
+remoteGoalScored.OnClientEvent:Connect(onGoalScored)
+
+log("BallClient ready")
