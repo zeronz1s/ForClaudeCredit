@@ -105,8 +105,9 @@ local CONFIG = {
 	FOLDER_NAME = "BoostPads",
 	PAD_TAG = "BoostPad",
 	REMOTE_PICKUP = RLShared.REMOTES.BOOST_PICKUP or "BoostPickup",
-	CAR_EVENTS_FOLDER = "CarEvents", -- ServerStorage > CarEvents > AddBoost (made by CarController, optional)
-	ADD_BOOST_EVENT = "AddBoost",
+	-- ServerStorage > CarEvents > AddBoost (made by CarController, optional)
+	CAR_EVENTS_FOLDER = RLShared.FOLDERS.CAR_EVENTS or "CarEvents",
+	ADD_BOOST_EVENT = (RLShared.CAR_EVENTS and RLShared.CAR_EVENTS.ADD_BOOST) or "AddBoost",
 	CAR_HITBOX_NAME = "Hitbox",      -- fallback if no part carries the CarHitbox tag
 }
 
