@@ -1,0 +1,39 @@
+ARENA + BOOST PADS: STUDIO CHECKLIST
+====================================
+
+Files (each one is a full replacement, paste the whole thing):
+  ServerScriptService/ArenaBuilder.txt                  -> Script      in ServerScriptService, named ArenaBuilder
+  ServerScriptService/BoostPadServer.txt                -> Script      in ServerScriptService, named BoostPadServer
+  StarterPlayer/StarterPlayerScripts/BoostPadClient.txt -> LocalScript in StarterPlayer > StarterPlayerScripts, named BoostPadClient
+
+Needs ReplicatedStorage > RLShared (the shared ModuleScript) to already be in your place.
+Works with BallServer / BallClient and CarController / CarInput if you have them.
+
+Newly inserted scripts come out Sandboxed in your place, so duplicate existing ones:
+
+ 1. In ServerScriptService, select BallServer and press Ctrl+D.
+ 2. Rename the copy to ArenaBuilder. Open it, select all, paste ArenaBuilder.txt.
+ 3. Select BallServer again, press Ctrl+D.
+ 4. Rename the copy to BoostPadServer. Open it, select all, paste BoostPadServer.txt.
+ 5. In StarterPlayer > StarterPlayerScripts, select BallClient and press Ctrl+D.
+ 6. Rename the copy to BoostPadClient. Open it, select all, paste BoostPadClient.txt.
+    (Check it's still a LocalScript, and the two server ones are still Scripts.)
+ 7. In Workspace, delete Baseplate (ArenaBuilder also removes it at runtime
+    while REMOVE_BASEPLATE = true, but deleting it keeps Edit mode clean).
+ 8. In Workspace, delete any old Goals folder, CarSpawns folder and BoostPads
+    folder you made by hand, unless you want to keep your own (the scripts
+    leave your own spawn parts and your own pads alone).
+ 9. Press Play. In Output you should see:
+      [ARENA] arena built: 380 parts ...
+      [ARENA] goal volumes placed, front face at +/- 204.97 studs
+      [ARENA] kickoff spots placed: 5 per team
+      [BOOSTPAD] tracking 34 pads
+10. Drive over a small pad: Output shows [BOOSTPAD] ... took SmallPadN | boost 33 -> 45.
+
+Optional looks (all in the CONFIG block at the top of each file):
+  ArenaBuilder   CONFIG.SKY        paste six rbxassetid:// ids from a Toolbox skybox
+  BoostPadClient SMALL_PICKUP_SOUND / BIG_PICKUP_SOUND  paste rbxassetid:// ids from Toolbox audio
+  ArenaBuilder   DEBUG_SHOW_SPAWNS = true  shows the kickoff spots
+  BoostPadServer DEBUG_SHOW_PICKUP_AREA = true  shows each pad's pickup cylinder
+
+Turn off the logs when you're done testing: set DEBUG = false in each CONFIG.
